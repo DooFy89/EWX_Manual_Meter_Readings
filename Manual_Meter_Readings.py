@@ -498,7 +498,7 @@ def resolve_unit_from_scaler(quantity: str, scaler: int) -> str:
     if not base:
         return ""
 
-    # En DLMS, Scaler = -3 → k (instruction fournie par l'utilisateur)
+    # En DLMS, Scaler = -3 → k
     prefix_map = {
         -3: "k",
         -6: "M",
@@ -1057,15 +1057,16 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
 
 def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
     """
-    Parse un fichier XML DLMS/COSEM de profil de charge.
+    Parse un fichier XML DLMS/COSEM (ProfileBuffer ou BillingValues).
 
     Points importants:
     - Le meter_id est extrait de <DDID> et contient déjà l'info complète
     - Pas de concaténation avec le préfixe mRID manuel
     - L'unité est déduite du scaler_unit DLMS (Wh, kWh, varh, etc.)
+    - Détecte automatiquement le type de fichier (ProfileBuffer vs BillingValues)
     """
     warnings: List[str] = []
-    
+
     try:
         content = file_bytes.decode('utf-8')
     except UnicodeDecodeError:
@@ -1073,13 +1074,60 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
             content = file_bytes.decode('utf-8-sig')
         except UnicodeDecodeError:
             content = file_bytes.decode('latin-1')
-    
+
     try:
         root = ET.fromstring(content)
     except ET.ParseError as e:
         warnings.append(f"Erreur de parsing XML: {str(e)}")
         return []
-    
+
+    # === Détection du type de fichier ===
+    # Vérifier l'attribut DDSubset dans l'élément DDs
+    dd_subset = None
+
+    # Chercher avec namespace
+    ns = {"ns": "http://tempuri.org/DeviceDescriptionDataSet.xsd"}
+    dds_elem = root.find(".//ns:DDs", ns)
+    if dds_elem is not None:
+        dd_subset = dds_elem.get("DDSubset", "")
+
+    # Fallback sans namespace
+    if dd_subset is None:
+        for elem in root.iter():
+            tag_name = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+            if tag_name == "DDs":
+                dd_subset = elem.get("DDSubset", "")
+                break
+
+    # Router vers la bonne fonction de parsing
+    if dd_subset == "BillingValues":
+        return parse_xml_billing_values(file_bytes, filename)
+    else:
+        # Par défaut, traiter comme ProfileBuffer
+        return parse_xml_profile_buffer(file_bytes, filename)
+
+
+def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
+    """
+    Parse un fichier XML DLMS/COSEM de profil de charge (ProfileBuffer).
+    Utilisé pour les fichiers E360, LGZ avec des séries temporelles.
+    """
+    warnings: List[str] = []
+
+    try:
+        content = file_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            content = file_bytes.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            content = file_bytes.decode('latin-1')
+
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as e:
+        warnings.append(f"Erreur de parsing XML: {str(e)}")
+        return []
+
     # === 1. Extraire DDID (meter ID) ===
     ddid_elem = root.find(".//{http://tempuri.org/DeviceDescriptionDataSet.xsd}DDID")
     if ddid_elem is None:
@@ -1187,19 +1235,25 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
     # === 4. Extraire les capture_objects ===
     capture_objects: Dict[int, str] = {}
 
-    pattern_capture_obj = re.compile(
+    # Patterns pour différents formats de fichiers
+    # Format 1: DD.Profile_Load01 (LGZ avec 0)
+    # Format 2: DD.Profile_Load1 (E360 sans 0)
+    pattern_capture_obj_1 = re.compile(
         rf"DD\.Profile_Load{profile_num}\.capture_objects\.0\.(\d+)\.logical_name"
     )
-    
+    pattern_capture_obj_2 = re.compile(
+        rf"DD\.Profile_Load{int(profile_num)}\.capture_objects\.0\.(\d+)\.logical_name"
+    )
+
     for field in root.iter():
         field_name = field.get("FieldName", "")
-        match = pattern_capture_obj.match(field_name)
+        match = pattern_capture_obj_1.match(field_name) or pattern_capture_obj_2.match(field_name)
         if match and field.get("FieldValue"):
             idx = int(match.group(1))
             obis_hex = field.get("FieldValue", "")
             obis_readable = obis_hex_to_readable(obis_hex)
             capture_objects[idx] = obis_readable
-    
+
     if not capture_objects:
         warnings.append("capture_objects non trouvés dans le fichier XML")
         return []
@@ -1227,18 +1281,30 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         channels[obis] = {"unit": detected_unit, "readings": []}
 
     # === 6. Extraire les données du buffer ===
-    pattern_response = re.compile(
+    # Patterns pour différents formats de fichiers
+    # Format LGZ: DD.Profile_Load01.buffer.Selector1.Response.X.Y
+    pattern_response_1 = re.compile(
         rf"DD\.Profile_Load{profile_num}\.buffer\.Selector1\.Response\.(\d+)\.(\d+)"
     )
-    
+    # Format E360 avec buffer direct: DD.Profile_Load1.buffer.0.X.Y
+    pattern_response_2 = re.compile(
+        rf"DD\.Profile_Load{int(profile_num)}\.buffer\.0\.(\d+)\.(\d+)"
+    )
+    # Format LGZ sans 0: (au cas où)
+    pattern_response_3 = re.compile(
+        rf"DD\.Profile_Load{int(profile_num)}\.buffer\.Selector1\.Response\.(\d+)\.(\d+)"
+    )
+
     response_data: Dict[int, Dict[int, str]] = {}
     timestamp_field_type = ""
     timestamps_are_utc = True  # Par défaut, les payloads XML sont interprétés en UTC
     timezone_offset_checked = False
-    
+
     for field in root.iter():
         field_name = field.get("FieldName", "")
-        match = pattern_response.match(field_name)
+        match = (pattern_response_1.match(field_name) or
+                 pattern_response_2.match(field_name) or
+                 pattern_response_3.match(field_name))
         if match:
             row = int(match.group(1))
             col = int(match.group(2))
@@ -1315,6 +1381,193 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         warnings=warnings,
         from_xml=True,  # Flag pour identifier les données XML
         timestamps_utc=timestamps_are_utc
+    )]
+
+
+def parse_xml_billing_values(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
+    """
+    Parse un fichier XML DLMS/COSEM de type BillingValues (E570).
+    Ces fichiers contiennent des valeurs uniques de registres à un instant T,
+    pas des séries temporelles.
+    """
+    warnings: List[str] = []
+
+    try:
+        content = file_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            content = file_bytes.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            content = file_bytes.decode('latin-1')
+
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as e:
+        warnings.append(f"Erreur de parsing XML: {str(e)}")
+        return []
+
+    # === 1. Extraire DDID (meter ID) ===
+    ddid_elem = root.find(".//{http://tempuri.org/DeviceDescriptionDataSet.xsd}DDID")
+    if ddid_elem is None:
+        ddid_elem = root.find(".//DDID")
+
+    if ddid_elem is None or not ddid_elem.text:
+        warnings.append("DDID (meter ID) non trouvé dans le fichier XML")
+        return []
+
+    meter_id = ddid_elem.text.strip()
+
+    # === 2. Extraire la date de lecture (ModificationDateTime) ===
+    timestamp = None
+    mod_datetime_elem = root.find(".//{http://tempuri.org/DeviceDescriptionDataSet.xsd}ModificationDateTime")
+    if mod_datetime_elem is None:
+        mod_datetime_elem = root.find(".//ModificationDateTime")
+
+    if mod_datetime_elem is not None and mod_datetime_elem.text:
+        try:
+            # Format: 2025-08-27T12:32:26.7030356+02:00
+            timestamp_str = mod_datetime_elem.text.strip()
+            # Supprimer les microsecondes excessives (garder 6 chiffres max)
+            timestamp_str = re.sub(r'(\.\d{6})\d+', r'\1', timestamp_str)
+            timestamp = datetime.fromisoformat(timestamp_str)
+        except Exception as e:
+            warnings.append(f"Erreur de parsing de la date: {str(e)}")
+
+    # Fallback: utiliser la date actuelle si pas trouvée
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc)
+        warnings.append("Date de lecture non trouvée, utilisation de la date actuelle")
+
+    # === 3. Extraire tous les registres de type ClassID="3" (Register) ===
+    # Pattern pour trouver les objets avec ClassID="3"
+    registers: Dict[str, Dict[str, Any]] = {}
+
+    for obj in root.iter():
+        if obj.tag.endswith("Objects") or obj.tag == "Objects":
+            class_id = obj.get("ClassID")
+            if class_id != "3":  # ClassID 3 = Register
+                continue
+
+            obj_name = obj.get("ObjectName", "")
+            logical_name = obj.get("ObjectLogicalName", "")
+
+            if not logical_name:
+                continue
+
+            # Convertir en format lisible OBIS
+            obis_readable = obis_hex_to_readable(logical_name)
+
+            # Ne garder que les codes OBIS pertinents (énergie)
+            if not (obis_readable.startswith("1-0:1.") or
+                    obis_readable.startswith("1-0:2.") or
+                    obis_readable.startswith("1-0:3.") or
+                    obis_readable.startswith("1-0:4.") or
+                    obis_readable.startswith("1-0:5.") or
+                    obis_readable.startswith("1-0:6.") or
+                    obis_readable.startswith("1-0:7.") or
+                    obis_readable.startswith("1-0:8.") or
+                    obis_readable.startswith("1-0:9.")):
+                continue
+
+            registers[obis_readable] = {
+                "obj_name": obj_name,
+                "value": None,
+                "unit": "",
+                "scaler": 0,
+                "quantity": ""
+            }
+
+    # === 4. Extraire les valeurs et unités des registres ===
+    for field in root.iter():
+        field_name = field.get("FieldName", "")
+        if not field_name:
+            continue
+
+        # Patterns pour extraire les informations
+        # Format: DD.00003_0100010800FF.CurrentValue
+        # Format: DD.00003_0100010800FF.UnitScale.0.Scaler
+        # Format: DD.00003_0100010800FF.UnitScale.0.Quantity
+
+        match_current = re.match(r"DD\.[\w_]+\.CurrentValue", field_name)
+        if match_current:
+            # Extraire le code OBIS du nom du champ
+            obis_match = re.search(r"_([0-9A-F]{12})\.", field_name)
+            if obis_match:
+                obis_hex = obis_match.group(1)
+                obis_readable = obis_hex_to_readable(obis_hex)
+                if obis_readable in registers:
+                    value_str = field.get("FieldValue", "")
+                    try:
+                        registers[obis_readable]["value"] = float(value_str)
+                    except (ValueError, TypeError):
+                        pass
+            continue
+
+        match_scaler = re.match(r"DD\.[\w_]+\.UnitScale\.0\.Scaler", field_name)
+        if match_scaler:
+            obis_match = re.search(r"_([0-9A-F]{12})\.", field_name)
+            if obis_match:
+                obis_hex = obis_match.group(1)
+                obis_readable = obis_hex_to_readable(obis_hex)
+                if obis_readable in registers:
+                    scaler_str = field.get("FieldValue", "")
+                    try:
+                        registers[obis_readable]["scaler"] = int(scaler_str)
+                    except (ValueError, TypeError):
+                        pass
+            continue
+
+        match_quantity = re.match(r"DD\.[\w_]+\.UnitScale\.0\.Quantity", field_name)
+        if match_quantity:
+            obis_match = re.search(r"_([0-9A-F]{12})\.", field_name)
+            if obis_match:
+                obis_hex = obis_match.group(1)
+                obis_readable = obis_hex_to_readable(obis_hex)
+                if obis_readable in registers:
+                    registers[obis_readable]["quantity"] = field.get("FieldValue", "")
+            continue
+
+    # === 5. Construire les channels avec une seule lecture ===
+    channels: Dict[str, Dict[str, Any]] = {}
+
+    for obis, info in registers.items():
+        if info["value"] is None:
+            continue
+
+        # Résoudre l'unité
+        quantity = info.get("quantity", "")
+        scaler = info.get("scaler", 0)
+        unit = resolve_unit_from_scaler(quantity, scaler)
+
+        if not unit:
+            # Fallback basé sur le code OBIS
+            if obis.startswith("1-0:1.") or obis.startswith("1-0:2."):
+                unit = "Wh"
+            elif obis.startswith("1-0:5.") or obis.startswith("1-0:6."):
+                unit = "varh"
+            else:
+                unit = "Wh"
+
+        # Créer le channel avec une seule mesure (tuple format)
+        channels[obis] = {
+            "unit": unit,
+            "readings": [(timestamp, info["value"], 0)]  # Format: (timestamp, value, dst)
+        }
+
+    if not channels:
+        warnings.append("Aucun registre valide trouvé dans le fichier BillingValues")
+        return []
+
+    # === 6. Retourner les données parsées ===
+    return [ParsedMeterData(
+        meter_id=meter_id,
+        load_profile="Valeurs de facturation",
+        interval="NULL",  # Pas d'intervalle pour des valeurs uniques
+        channels=channels,
+        source_file=filename,
+        warnings=warnings,
+        from_xml=True,
+        timestamps_utc=False  # Timestamp avec timezone explicite
     )]
 
 

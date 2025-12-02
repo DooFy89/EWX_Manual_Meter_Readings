@@ -20,7 +20,7 @@ ENV/
 .history/
 OLD/
 
-# Data files (optionnel - décommentez si vous ne voulez pas partager les données)
+# Data files
 Data/
 *.csv
 *.xlsx
