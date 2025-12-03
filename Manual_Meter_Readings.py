@@ -2442,10 +2442,19 @@ def find_unmapped_obis(data: ParsedMeterData) -> List[str]:
 # SECTION 5 : CONVERTISSEUR JSON
 # ============================================================================
 
-def convert_to_json(data: ParsedMeterData, source: str, mrid_prefix: str) -> Tuple[Dict, str]:
+def convert_to_json(data: ParsedMeterData, source: str, mrid_prefix: str) -> Optional[Tuple[Dict, str]]:
     """
     Convertit ParsedMeterData en structure JSON MeterReadings.
-    
+
+    Args:
+        data: Données parsées du compteur
+        source: Source système (ex: WESTNETZ)
+        mrid_prefix: Préfixe pour le mRID (ex: ESR103071)
+
+    Returns:
+        Tuple[Dict, str]: (document JSON, nom de fichier) si données disponibles
+        None: si aucune donnée à exporter (IntervalBlocks vide)
+
     Note: Pour les fichiers XML, le meter_id contient déjà l'identifiant complet
     (ex: LGZ1030767023632), donc on n'ajoute pas le préfixe mRID.
     """
@@ -2489,7 +2498,11 @@ def convert_to_json(data: ParsedMeterData, source: str, mrid_prefix: str) -> Tup
                 ],
                 "ReadingType": {"ref": iec_code}
             })
-    
+
+    # Ne pas générer de document si aucune donnée à exporter
+    if not interval_blocks:
+        return None
+
     document = {
         "header": {
             "messageId": message_id,
@@ -2993,15 +3006,24 @@ def main():
             st.session_state.files_needing_config = files_needing_config
             
             json_outputs = []
+            billing_values_skipped = []
             for data in data_list:
-                doc, fname = convert_to_json(data, source, mrid_prefix)
-                
+                result = convert_to_json(data, source, mrid_prefix)
+                if result is None:
+                    # Aucune donnée à exporter pour ce compteur (IntervalBlocks vide)
+                    # Probablement un fichier BillingValues
+                    if data.load_profile == "Valeurs de facturation":
+                        billing_values_skipped.append(data.source_file)
+                    continue
+
+                doc, fname = result
+
                 # Pour XML, le mrid est déjà complet
                 if data.from_xml:
                     display_mrid = data.meter_id
                 else:
                     display_mrid = f"{mrid_prefix}{data.meter_id}"
-                
+
                 json_outputs.append({
                     "filename": fname,
                     "content": json.dumps(doc, indent=4, ensure_ascii=False),
@@ -3011,13 +3033,21 @@ def main():
             
             st.session_state.json_outputs = json_outputs
             st.session_state.conversion_done = True
-        
+
         if data_list:
             st.success(f"{len(data_list)} compteur(s) traité(s) avec succès!")
-        
+
+        if billing_values_skipped:
+            st.warning(
+                f"⚠️ {len(billing_values_skipped)} fichier(s) BillingValues non exporté(s) : "
+                f"Les fichiers de type 'Valeurs de facturation' (BillingValues) ne contiennent pas de données "
+                f"de séries temporelles et ne peuvent pas être convertis en JSON MeterReadings.\n\n"
+                f"Fichiers concernés : {', '.join(billing_values_skipped)}"
+            )
+
         if files_needing_config:
             st.info(f"{len(files_needing_config)} fichier(s) nécessitent une configuration manuelle (voir ci-dessous)")
-        
+
         if not data_list and not files_needing_config:
             st.error("Aucun compteur n'a pu être traité. Vérifiez les avertissements.")
     
@@ -3047,9 +3077,14 @@ def main():
                     
                     if results and not results[0].needs_user_input:
                         st.session_state.processed_data.extend(results)
-                        
+
                         for data in results:
-                            doc, fname = convert_to_json(data, source, mrid_prefix)
+                            result = convert_to_json(data, source, mrid_prefix)
+                            if result is None:
+                                # Aucune donnée à exporter pour ce compteur (IntervalBlocks vide)
+                                continue
+
+                            doc, fname = result
                             st.session_state.json_outputs.append({
                                 "filename": fname,
                                 "content": json.dumps(doc, indent=4, ensure_ascii=False),
