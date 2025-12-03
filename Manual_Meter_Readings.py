@@ -2839,25 +2839,27 @@ def render_chart(
     ]).sort_values("Timestamp")
     
     desc = OBIS_DESCRIPTIONS.get(obis_code, obis_code)
-    
+
     fig = px.line(
         df,
         x="Timestamp",
         y="Valeur",
         title=f"Courbe de charge - {display_mrid} - {desc}",
         labels={"Valeur": f"Valeur ({unit})" if unit else "Valeur", "Timestamp": "Date/Heure"},
-        color_discrete_sequence=["#1f77b4"]
+        color_discrete_sequence=["#1f77b4"],
+        markers=True  # Ajouter des marqueurs sur chaque point
     )
-    
+
     fig.update_layout(
         hovermode="x unified",
         xaxis_title="Date/Heure",
         yaxis_title=f"Valeur ({unit})" if unit else "Valeur",
         height=400
     )
-    
+
     fig.update_traces(
-        hovertemplate="<b>%{x}</b><br>Valeur: %{y:,.3f}<extra></extra>"
+        hovertemplate="<b>%{x}</b><br>Valeur: %{y:,.3f}<extra></extra>",
+        marker=dict(size=8, line=dict(width=2, color='white'))  # Marqueurs plus visibles
     )
     
     st.plotly_chart(fig, use_container_width=True)
