@@ -59,6 +59,31 @@ LOAD_PROFILES = {
     "1-0:99.2.0": ("Profil de charge 2", "24h")
 }
 
+
+def extract_lp_abbreviation(load_profile: str) -> str:
+    """
+    Extrait l'abréviation LP depuis le nom du profil de charge.
+
+    Exemples:
+        - "Profil de charge 1" → "LP1"
+        - "Profil de charge 2" → "LP2"
+        - "Load Profile 1" → "LP1"
+        - "Valeurs de facturation" → "" (pas de LP)
+
+    Args:
+        load_profile: Nom du profil de charge
+
+    Returns:
+        Abréviation "LPX" ou chaîne vide si pas de profil numéroté
+    """
+    import re
+    # Chercher un chiffre dans le nom du profil
+    match = re.search(r'(\d+)', load_profile)
+    if match and ('profil' in load_profile.lower() or 'load' in load_profile.lower()):
+        return f"LP{match.group(1)}"
+    return ""
+
+
 # DST (Daylight Saving Time) → Offset timezone Europe/Zurich
 # 0 = heure d'hiver (STD), 8 = heure d'été (DST)
 DST_OFFSETS = {
@@ -237,6 +262,62 @@ class ParseResult:
     confidence: float  # 0.0 à 1.0
     strategy_used: str
     needs_user_input: List[str] = field(default_factory=list)
+
+
+# ============================================================================
+# SECTION 2B : STRUCTURES POUR PARSING XML FLEXIBLE
+# ============================================================================
+
+class XMLParseException(Exception):
+    """Exception levée quand un fichier XML ne peut pas être parsé.
+
+    Fournit des diagnostics détaillés pour aider l'utilisateur à comprendre
+    pourquoi le parsing a échoué.
+    """
+    pass
+
+
+@dataclass
+class UnitInfo:
+    """Informations sur une unité extraite du XML."""
+    obis_code: str  # Format lisible (ex: "1-0:1.8.0")
+    scaler: int  # Scaler DLMS (-3 = kilo, 0 = base, etc.)
+    quantity: str  # Type de quantité (ActiveEnergy, ReactiveEnergy, etc.)
+    resolved_unit: str  # Unité résolue (Wh, kWh, varh, etc.)
+
+
+@dataclass
+class ProfileObject:
+    """Informations sur un profil découvert dans le XML."""
+    object_name: str  # Nom de l'objet (ex: "DD.Profile_Load1")
+    logical_name: str  # Code OBIS en hexadécimal
+    profile_index: Optional[int]  # 1, 2, etc. (None si non détecté)
+    class_id: int  # ClassID DLMS
+    has_buffer: bool  # Possède attribut buffer
+    has_capture_objects: bool  # Possède attribut capture_objects
+    capture_period: Optional[int]  # Période de capture en secondes (si trouvée)
+    buffer_patterns: List[str] = field(default_factory=list)  # Patterns de chemins découverts
+
+
+@dataclass
+class StructureMap:
+    """Carte complète de la structure XML découverte."""
+    meter_id: str  # DDID
+    ddsubset: str  # ProfileBuffer, BillingValues, etc.
+    profiles: List[ProfileObject]  # Profils découverts
+    units: Dict[str, UnitInfo]  # OBIS → UnitInfo
+    capture_objects: Dict[str, Dict[int, str]]  # profile_name → {idx: OBIS}
+    buffer_patterns: Dict[str, List[re.Pattern]]  # profile_name → patterns regex
+    timestamp_field_types: Dict[str, str]  # profile_name → field type
+    namespace: Optional[str] = None  # Namespace XML si présent
+
+
+@dataclass
+class ReadingRow:
+    """Une ligne de mesures avec timestamp."""
+    timestamp: datetime
+    dst_value: int  # Valeur DST (0=STD, 8=DST)
+    values: Dict[str, float]  # OBIS code → valeur
 
 
 # ============================================================================
@@ -512,6 +593,515 @@ def resolve_unit_from_scaler(quantity: str, scaler: int) -> str:
         return f"{prefix_map[scaler]}{base}"
 
     return f"{base}*10^{scaler}"
+
+
+# ============================================================================
+# SECTION 3B : HANDLERS POUR PARSING XML FLEXIBLE
+# ============================================================================
+
+class OBISCodeHandler:
+    """
+    Gestionnaire de codes OBIS avec capacités de conversion générique.
+    Utilise les fonctions existantes (obis_hex_to_readable, resolve_unit_from_scaler)
+    et ajoute des méthodes d'inférence intelligente.
+    """
+
+    @staticmethod
+    def hex_to_readable(hex_obis: str) -> str:
+        """
+        Convertit un code OBIS hex en format lisible.
+        Wrapper autour de la fonction existante.
+        """
+        return obis_hex_to_readable(hex_obis)
+
+    @staticmethod
+    def infer_unit_from_obis(obis_code: str, scaler: Optional[int] = None,
+                             quantity: Optional[str] = None) -> str:
+        """
+        Infère l'unité d'un code OBIS de manière intelligente.
+
+        Args:
+            obis_code: Code OBIS format lisible (ex: "1-0:1.8.0")
+            scaler: Scaler DLMS si disponible
+            quantity: Quantity DLMS si disponible (plus fiable)
+
+        Returns:
+            Unité déduite (Wh, kWh, varh, etc.)
+        """
+        # Si on a quantity + scaler, utiliser la fonction existante
+        if quantity and scaler is not None:
+            return resolve_unit_from_scaler(quantity, scaler)
+
+        # Sinon, inférer depuis la structure OBIS
+        # Format: A-B:C.D.E ou A-B:C.D.E*F
+        parts = obis_code.replace('-', ':').split(':')
+        if len(parts) < 2:
+            return ""
+
+        # Extraire le byte C (type de mesure)
+        c_parts = parts[1].split('.')
+        if len(c_parts) < 2:
+            return ""
+
+        try:
+            c = int(c_parts[0])  # 1=actif, 2=actif export, 5-8=réactif
+            d = int(c_parts[1])  # 6=max demand, 7=instantané, 8=énergie (time integral)
+
+            # Déterminer le type d'énergie
+            if c in [1, 2]:  # Active
+                base_unit = "Wh"
+            elif c in [5, 6, 7, 8]:  # Reactive
+                base_unit = "varh"
+            elif c in [9]:  # Apparent
+                base_unit = "VAh"
+            else:
+                base_unit = "Wh"  # Default
+
+            # Appliquer le scaler si disponible
+            if scaler is not None:
+                if scaler == 0:
+                    return base_unit
+                elif scaler == -3:
+                    return f"k{base_unit}"
+                elif scaler == -6:
+                    return f"M{base_unit}"
+                else:
+                    return f"{base_unit}*10^{scaler}"
+
+            return base_unit
+
+        except (ValueError, IndexError):
+            return "Wh"  # Safe default
+
+    @staticmethod
+    def is_energy_obis(obis_code: str) -> bool:
+        """
+        Vérifie si un code OBIS représente une mesure d'énergie
+        (vs status, timestamp, configuration).
+
+        Args:
+            obis_code: Code OBIS format lisible (ex: "1-0:1.8.0")
+
+        Returns:
+            True si c'est une mesure d'énergie
+        """
+        # Filtrer les codes non-énergie connus
+        if obis_code.startswith("0-0:1."):  # Clock/date
+            return False
+        if obis_code.startswith("0-0:96."):  # Status/config
+            return False
+
+        # Extraire le byte C
+        parts = obis_code.replace('-', ':').split(':')
+        if len(parts) < 2:
+            return False
+
+        c_parts = parts[1].split('.')
+        if len(c_parts) < 3:
+            return False
+
+        try:
+            c = int(c_parts[0])  # Type de mesure
+            d = int(c_parts[1])  # Méthode
+
+            # C in 1-9 = mesures électriques
+            # D = 8 (time integral = énergie) ou 6 (max demand)
+            if c in range(1, 10) and d in [6, 8]:
+                return True
+
+            return False
+
+        except (ValueError, IndexError):
+            return False
+
+    @staticmethod
+    def get_display_name(obis_code: str) -> str:
+        """
+        Génère un nom d'affichage lisible pour un code OBIS.
+        Tente d'abord le lookup, sinon génère depuis la structure.
+
+        Args:
+            obis_code: Code OBIS format lisible
+
+        Returns:
+            Nom d'affichage (ex: "Active Energy Import (Total)")
+        """
+        # Tenter le lookup existant
+        display_name = get_obis_display_name(obis_code)
+        if display_name != obis_code:  # Si trouvé dans OBIS_DESCRIPTIONS
+            return display_name
+
+        # Générer depuis la structure
+        parts = obis_code.replace('-', ':').split(':')
+        if len(parts) < 2:
+            return obis_code
+
+        c_parts = parts[1].split('.')
+        if len(c_parts) < 3:
+            return obis_code
+
+        try:
+            c = int(c_parts[0])
+            e = int(c_parts[2])
+
+            # Déterminer le type
+            energy_type = {
+                1: "Active Energy Import",
+                2: "Active Energy Export",
+                5: "Reactive Energy Q1 (Ri+)",
+                6: "Reactive Energy Q2 (Rc+)",
+                7: "Reactive Energy Q3 (Ri-)",
+                8: "Reactive Energy Q4 (Rc-)",
+                9: "Apparent Energy"
+            }.get(c, f"Energy Type {c}")
+
+            # Déterminer le tarif/registre
+            if e == 0:
+                tariff = "(Total)"
+            elif e in [1, 2, 3, 4]:
+                tariff = f"(Tariff {e})"
+            else:
+                tariff = f"(Register {e})"
+
+            return f"{energy_type} {tariff}"
+
+        except (ValueError, IndexError):
+            return obis_code
+
+
+class ProfileDetector:
+    """Détecteur de métadonnées de profil sans valeurs hardcodées."""
+
+    def __init__(self, profile_obj: ProfileObject):
+        self.profile = profile_obj
+
+    def detect_interval(self, timestamps: List[datetime]) -> str:
+        """Calcule l'intervalle depuis les différences de timestamps."""
+        if not timestamps or len(timestamps) < 2:
+            # Fallback sur capture_period si disponible
+            if self.profile.capture_period:
+                return self._seconds_to_interval(self.profile.capture_period)
+            return "15min"  # Default
+
+        # Calculer les différences
+        diffs = []
+        sorted_ts = sorted(timestamps)
+        for i in range(1, min(len(sorted_ts), 100)):  # Limiter à 100 échantillons
+            diff = (sorted_ts[i] - sorted_ts[i-1]).total_seconds()
+            if diff > 0:  # Ignorer les doublons
+                diffs.append(diff)
+
+        if not diffs:
+            return "15min"
+
+        # Trouver le mode (valeur la plus fréquente)
+        from collections import Counter
+        counter = Counter(diffs)
+        most_common_diff = counter.most_common(1)[0][0]
+
+        return self._seconds_to_interval(int(most_common_diff))
+
+    def _seconds_to_interval(self, seconds: int) -> str:
+        """Convertit secondes en format lisible."""
+        if seconds == 900:
+            return "15min"
+        elif seconds == 1800:
+            return "30min"
+        elif seconds == 3600:
+            return "1h"
+        elif seconds == 21600:
+            return "6h"
+        elif seconds == 86400:
+            return "24h"
+        elif seconds < 3600:
+            return f"{seconds//60}min"
+        elif seconds < 86400:
+            return f"{seconds//3600}h"
+        else:
+            return f"{seconds//86400}d"
+
+    def detect_profile_name(self, interval: str) -> str:
+        """Génère un nom de profil significatif."""
+        # Extraire numéro depuis object_name si possible
+        if self.profile.profile_index:
+            return f"Profil de charge {self.profile.profile_index}"
+
+        # Fallback sur interval
+        return f"Profil de charge ({interval})"
+
+
+class XMLStructureExplorer:
+    """Explorateur de structure XML DLMS/COSEM."""
+
+    def __init__(self, root: ET.Element):
+        self.root = root
+        self.namespace = self._detect_namespace()
+
+    def _detect_namespace(self) -> Optional[str]:
+        """Détecte le namespace XML."""
+        if '}' in self.root.tag:
+            return self.root.tag.split('}')[0][1:]
+        return None
+
+    def discover_structure(self, ddid: str, ddsubset: str) -> StructureMap:
+        """Découvre la structure complète du XML."""
+        profiles = self.find_profile_objects()
+        units = self.extract_units_from_registers()
+
+        # Pour chaque profil, découvrir capture_objects et buffer_patterns
+        capture_objects_map = {}
+        buffer_patterns_map = {}
+
+        for profile in profiles:
+            capture_objs = self.find_capture_objects_dynamic(profile.object_name)
+            capture_objects_map[profile.object_name] = capture_objs
+
+            buffer_pats = self.find_buffer_data_paths(profile.object_name)
+            buffer_patterns_map[profile.object_name] = buffer_pats
+
+        return StructureMap(
+            meter_id=ddid,
+            ddsubset=ddsubset,
+            profiles=profiles,
+            units=units,
+            capture_objects=capture_objects_map,
+            buffer_patterns=buffer_patterns_map,
+            timestamp_field_types={},
+            namespace=self.namespace
+        )
+
+    def find_profile_objects(self) -> List[ProfileObject]:
+        """Trouve les profils Load1 et Load2."""
+        profiles = []
+
+        for obj in self.root.iter():
+            tag_name = obj.tag.split('}')[-1] if '}' in obj.tag else obj.tag
+            if tag_name != "Objects":
+                continue
+
+            obj_name = obj.get("ObjectName", "")
+            if not obj_name:
+                continue
+
+            # Chercher Load1 ou Load2 (variations: Load1, Load01, Load_1, etc.)
+            profile_num = None
+            if re.search(r'(Profile|Load)[\s_]*0?1\b', obj_name, re.IGNORECASE):
+                profile_num = 1
+            elif re.search(r'(Profile|Load)[\s_]*0?2\b', obj_name, re.IGNORECASE):
+                profile_num = 2
+
+            if profile_num is None:
+                continue
+
+            # Extraire métadonnées
+            logical_name = obj.get("ObjectLogicalName", "")
+            class_id = int(obj.get("ClassID", "0"))
+
+            # Vérifier présence buffer et capture_objects
+            has_buffer = False
+            has_capture_objects = False
+            capture_period = None
+
+            for attr in obj.iter():
+                attr_name = attr.get("AttributeName", "")
+                if "buffer" in attr_name.lower():
+                    has_buffer = True
+                if "capture_objects" in attr_name.lower():
+                    has_capture_objects = True
+                if "capture_period" in attr_name.lower():
+                    field_val = attr.get("FieldValue", "")
+                    try:
+                        capture_period = int(field_val)
+                    except (ValueError, TypeError):
+                        pass
+
+            if has_buffer and has_capture_objects:
+                profiles.append(ProfileObject(
+                    object_name=obj_name,
+                    logical_name=logical_name,
+                    profile_index=profile_num,
+                    class_id=class_id,
+                    has_buffer=has_buffer,
+                    has_capture_objects=has_capture_objects,
+                    capture_period=capture_period
+                ))
+
+        return profiles
+
+    def find_capture_objects_dynamic(self, profile_name: str) -> Dict[int, str]:
+        """Trouve les capture_objects sans assumer la structure."""
+        capture_objects = {}
+
+        # Pattern flexible pour capturer tous les chemins possibles
+        # Ex: DD.Profile_Load1.capture_objects.0.2.logical_name
+        pattern = re.compile(rf".*{re.escape(profile_name)}.*capture_objects.*\.(\d+)\.logical_name$")
+
+        for field in self.root.iter():
+            field_name = field.get("FieldName", "")
+            match = pattern.search(field_name)
+            if match:
+                idx = int(match.group(1))
+                obis_hex = field.get("FieldValue", "")
+                if obis_hex:
+                    obis_readable = OBISCodeHandler.hex_to_readable(obis_hex)
+                    capture_objects[idx] = obis_readable
+
+        return capture_objects
+
+    def find_buffer_data_paths(self, profile_name: str) -> List[re.Pattern]:
+        """Découvre dynamiquement les patterns de buffer."""
+        patterns_found = set()
+
+        # Chercher tous les champs buffer pour ce profil
+        for field in self.root.iter():
+            field_name = field.get("FieldName", "")
+
+            if profile_name not in field_name or "buffer" not in field_name:
+                continue
+
+            # Essayer de matcher différents patterns
+            # Pattern 1: buffer.Selector1.Response.X.Y
+            match1 = re.search(rf"{re.escape(profile_name)}\.buffer\.(Selector\d+\.Response)\.(\d+)\.(\d+)$", field_name)
+            if match1:
+                patterns_found.add(f"Selector{match1.group(1).split('Selector')[1].split('.')[0]}.Response")
+
+            # Pattern 2: buffer.0.X.Y
+            match2 = re.search(rf"{re.escape(profile_name)}\.buffer\.(\d+)\.(\d+)\.(\d+)$", field_name)
+            if match2:
+                patterns_found.add(f"{match2.group(1)}")
+
+        # Convertir en regex patterns
+        regex_patterns = []
+        for pat_str in patterns_found:
+            if "Selector" in pat_str:
+                regex_patterns.append(
+                    re.compile(rf"{re.escape(profile_name)}\.buffer\.{re.escape(pat_str)}\.(\d+)\.(\d+)$")
+                )
+            else:
+                regex_patterns.append(
+                    re.compile(rf"{re.escape(profile_name)}\.buffer\.{re.escape(pat_str)}\.(\d+)\.(\d+)$")
+                )
+
+        return regex_patterns
+
+    def extract_units_from_registers(self) -> Dict[str, UnitInfo]:
+        """Extrait unités de tous les registres."""
+        units = {}
+
+        for obj in self.root.iter():
+            tag_name = obj.tag.split('}')[-1] if '}' in obj.tag else obj.tag
+            if tag_name != "Objects":
+                continue
+
+            class_id = obj.get("ClassID", "")
+            if class_id != "3":  # Pas un register
+                continue
+
+            obj_logical_name = obj.get("ObjectLogicalName", "")
+            if not obj_logical_name:
+                continue
+
+            # Chercher scaler_unit dans les attributes
+            scaler = None
+            quantity = None
+
+            for attr in obj.iter():
+                attr_name = attr.get("AttributeName", "")
+                if "scaler_unit" in attr_name.lower() or "UnitScale" in attr_name:
+                    for field in attr.iter():
+                        field_name = field.get("FieldName", "")
+                        if "Scaler" in field_name:
+                            try:
+                                scaler = int(field.get("FieldValue", "0"))
+                            except (ValueError, TypeError):
+                                pass
+                        elif "Quantity" in field_name:
+                            quantity = field.get("FieldValue", "")
+
+            if scaler is not None and quantity:
+                obis_readable = OBISCodeHandler.hex_to_readable(obj_logical_name)
+                resolved_unit = OBISCodeHandler.infer_unit_from_obis(obis_readable, scaler, quantity)
+
+                units[obis_readable] = UnitInfo(
+                    obis_code=obis_readable,
+                    scaler=scaler,
+                    quantity=quantity,
+                    resolved_unit=resolved_unit
+                )
+
+        return units
+
+
+class DataPathResolver:
+    """Résolveur de chemins de données dans le XML."""
+
+    def __init__(self, root: ET.Element, structure_map: StructureMap):
+        self.root = root
+        self.structure = structure_map
+
+    def extract_buffer_data(self, profile_name: str) -> Dict[int, Dict[int, str]]:
+        """Extrait les données du buffer."""
+        buffer_data = {}
+        patterns = self.structure.buffer_patterns.get(profile_name, [])
+
+        if not patterns:
+            return buffer_data
+
+        for field in self.root.iter():
+            field_name = field.get("FieldName", "")
+
+            for pattern in patterns:
+                match = pattern.match(field_name)
+                if match:
+                    row = int(match.group(1))
+                    col = int(match.group(2))
+                    value = field.get("FieldValue", "")
+
+                    if row not in buffer_data:
+                        buffer_data[row] = {}
+                    buffer_data[row][col] = value
+                    break
+
+        return buffer_data
+
+    def match_timestamps_to_values(self, buffer_data: Dict[int, Dict[int, str]],
+                                   capture_objects: Dict[int, str]) -> List[ReadingRow]:
+        """Associe timestamps aux valeurs."""
+        readings = []
+
+        for row_idx in sorted(buffer_data.keys()):
+            row_data = buffer_data[row_idx]
+
+            # Column 0 = timestamp
+            if 0 not in row_data:
+                continue
+
+            timestamp_hex = row_data[0]
+            dt, dst_val = decode_dlms_timestamp(timestamp_hex)
+
+            if dt is None:
+                continue
+
+            # Extraire valeurs pour chaque OBIS
+            values = {}
+            for col_idx, obis_code in capture_objects.items():
+                if col_idx < 2:  # Skip timestamp et DST
+                    continue
+
+                if col_idx in row_data:
+                    try:
+                        values[obis_code] = float(row_data[col_idx])
+                    except (ValueError, TypeError):
+                        pass
+
+            if values:
+                readings.append(ReadingRow(
+                    timestamp=dt,
+                    dst_value=dst_val,
+                    values=values
+                ))
+
+        return readings
 
 
 # ============================================================================
@@ -1099,12 +1689,42 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
                 dd_subset = elem.get("DDSubset", "")
                 break
 
-    # Router vers la bonne fonction de parsing
-    if dd_subset == "BillingValues":
-        return parse_xml_billing_values(file_bytes, filename)
-    else:
-        # Par défaut, traiter comme ProfileBuffer
-        return parse_xml_profile_buffer(file_bytes, filename)
+    # Router vers la bonne fonction de parsing avec fallback flexible
+    try:
+        if dd_subset == "BillingValues":
+            result = parse_xml_billing_values(file_bytes, filename)
+        else:
+            # Par défaut, traiter comme ProfileBuffer
+            result = parse_xml_profile_buffer(file_bytes, filename)
+
+        # COUCHE 2: Fallback vers parser flexible si résultat vide
+        if not result or (result and len(result[0].channels) == 0):
+            # Parser existant n'a pas réussi, tenter découverte flexible
+            result = parse_xml_flexible(file_bytes, filename, dd_subset or "ProfileBuffer")
+
+        return result
+
+    except XMLParseException:
+        # Re-raise les erreurs de parsing flexible (fail completely)
+        raise
+
+    except Exception as e:
+        # Autres erreurs: tenter fallback avant d'échouer
+        try:
+            return parse_xml_flexible(file_bytes, filename, dd_subset or "ProfileBuffer")
+        except XMLParseException:
+            raise
+        except Exception as flex_error:
+            # Les deux parsers ont échoué
+            raise XMLParseException(
+                f"Impossible de parser {filename}\n\n"
+                f"Raison: Échec du parser standard ET du parser flexible\n"
+                f"DDSubset: {dd_subset or 'ProfileBuffer'}\n"
+                f"Erreur standard: {type(e).__name__}: {str(e)}\n"
+                f"Erreur flexible: {type(flex_error).__name__}: {str(flex_error)}\n\n"
+                f"Suggestion: Structure XML non supportée.\n"
+                f"Contactez le support technique avec ce fichier."
+            )
 
 
 def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
@@ -1571,6 +2191,221 @@ def parse_xml_billing_values(file_bytes: bytes, filename: str) -> List[ParsedMet
     )]
 
 
+def parse_xml_flexible(file_bytes: bytes, filename: str, dd_subset: str) -> List[ParsedMeterData]:
+    """
+    Flexible XML parser pour formats inconnus (fallback layer).
+    Découvre automatiquement la structure XML sans assumptions hardcodées.
+
+    Supporte uniquement Load1 et Load2 avec découverte automatique de:
+    - Chemins de buffer (Selector1.Response, .0., etc.)
+    - Capture objects à profondeur arbitraire
+    - Intervalles depuis timestamps réels
+    - Unités depuis OBIS codes
+
+    Args:
+        file_bytes: Contenu du fichier XML
+        filename: Nom du fichier (pour logs)
+        dd_subset: Type de données DLMS (ex: "ProfileBuffer")
+
+    Returns:
+        Liste de ParsedMeterData (1 par profil détecté)
+
+    Raises:
+        XMLParseException: Si la structure ne peut pas être découverte
+    """
+    warnings = []
+
+    try:
+        # Decode bytes to string
+        try:
+            content = file_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                content = file_bytes.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                content = file_bytes.decode('latin-1')
+
+        # === 1. Parser XML et créer explorer ===
+        root = ET.fromstring(content)
+        explorer = XMLStructureExplorer(root)
+
+        # Extraire meter ID (avec namespace fallback)
+        meter_id = "UNKNOWN"
+        ddid_elem = root.find(".//{http://tempuri.org/DeviceDescriptionDataSet.xsd}DDID")
+        if ddid_elem is None:
+            ddid_elem = root.find(".//DDID")
+        if ddid_elem is not None and ddid_elem.text:
+            meter_id = ddid_elem.text
+
+        # === 2. Découvrir structure ===
+        structure_map = explorer.discover_structure(meter_id, dd_subset)
+
+        # === 3. Validation: au moins 1 profil trouvé ===
+        if not structure_map.profiles:
+            analyzed_objects = len(root.findall(".//Object"))
+            object_names = [obj.find(".//ObjectName").text for obj in root.findall(".//Object")[:10]
+                           if obj.find(".//ObjectName") is not None and obj.find(".//ObjectName").text]
+
+            raise XMLParseException(
+                f"Impossible de parser {filename}\n\n"
+                f"Raison: Aucun objet profil Load1/Load2 détecté dans le XML\n"
+                f"DDSubset: {dd_subset}\n"
+                f"Objets analysés: {analyzed_objects}\n"
+                f"Profiles trouvés: 0\n\n"
+                f"Détails:\n"
+                f"- Aucun objet avec ClassID=7 (Profile Generic) et Load1/Load2\n"
+                f"- Aucun objet avec attributs 'buffer' ET 'capture_objects'\n"
+                f"- ObjectNames examinés: {object_names[:10]}\n\n"
+                f"Suggestion: Vérifiez que ce fichier est bien un profil de charge DLMS/COSEM valide.\n"
+                f"Si c'est un nouveau format de compteur, contactez le support technique."
+            )
+
+        # === 4. Traiter chaque profil découvert ===
+        results = []
+        resolver = DataPathResolver(root, structure_map)
+
+        for profile_obj in structure_map.profiles:
+            profile_name = profile_obj.object_name
+
+            # Validation: profil doit avoir buffer ET capture_objects
+            if not profile_obj.has_buffer or not profile_obj.has_capture_objects:
+                warnings.append(
+                    f"Profil {profile_name} incomplet: buffer={profile_obj.has_buffer}, "
+                    f"capture_objects={profile_obj.has_capture_objects}"
+                )
+                continue
+
+            # Vérifier que capture_objects existe dans la map
+            if profile_name not in structure_map.capture_objects:
+                warnings.append(f"Pas de capture_objects trouvés pour {profile_name}")
+                continue
+
+            capture_objects = structure_map.capture_objects[profile_name]
+
+            # Validation: capture_objects doit avoir au moins timestamp + 1 mesure
+            if len(capture_objects) < 2:
+                warnings.append(f"{profile_name}: Pas assez de capture_objects ({len(capture_objects)})")
+                continue
+
+            # Validation: timestamp doit être en index 0
+            if 0 not in capture_objects:
+                warnings.append(f"{profile_name}: Pas de timestamp en index 0")
+                continue
+
+            # === 4a. Extraire buffer data ===
+            try:
+                buffer_data = resolver.extract_buffer_data(profile_name)
+            except Exception as e:
+                warnings.append(f"{profile_name}: Échec extraction buffer - {str(e)}")
+                continue
+
+            if not buffer_data:
+                warnings.append(f"{profile_name}: Buffer vide")
+                continue
+
+            # === 4b. Matcher timestamps aux valeurs ===
+            try:
+                reading_rows = resolver.match_timestamps_to_values(buffer_data, capture_objects)
+            except Exception as e:
+                warnings.append(f"{profile_name}: Échec matching timestamps - {str(e)}")
+                continue
+
+            if not reading_rows:
+                warnings.append(f"{profile_name}: Aucune donnée après matching")
+                continue
+
+            # === 4c. Détecter intervalle ===
+            detector = ProfileDetector(profile_obj)
+            timestamps = [row.timestamp for row in reading_rows]
+            interval = detector.detect_interval(timestamps)
+            display_name = detector.detect_profile_name(interval)
+
+            # === 4d. Construire channels ===
+            channels = {}
+            obis_codes = sorted(set(
+                obis for row in reading_rows for obis in row.values.keys()
+            ))
+
+            for obis in obis_codes:
+                # Obtenir unité
+                unit = "NULL"
+                if obis in structure_map.units:
+                    unit = structure_map.units[obis].resolved_unit
+                else:
+                    # Fallback: inférer depuis OBIS
+                    unit = OBISCodeHandler.infer_unit_from_obis(obis, None, None)
+
+                # Construire liste de readings
+                readings = []
+                for row in reading_rows:
+                    if obis in row.values:
+                        readings.append({
+                            "timestamp": row.timestamp,
+                            "value": row.values[obis],
+                            "dst": row.dst_value
+                        })
+
+                if readings:
+                    channels[obis] = {
+                        "unit": unit,
+                        "readings": readings
+                    }
+
+            # Validation finale: au moins 1 channel avec données
+            if not channels:
+                warnings.append(f"{profile_name}: Aucun channel avec données")
+                continue
+
+            # === 4e. Créer ParsedMeterData ===
+            results.append(ParsedMeterData(
+                meter_id=meter_id,
+                load_profile=display_name,
+                interval=interval,
+                channels=channels,
+                source_file=filename,
+                warnings=warnings.copy(),
+                from_xml=True,
+                timestamps_utc=False
+            ))
+
+        # === 5. Validation globale: au moins 1 résultat ===
+        if not results:
+            raise XMLParseException(
+                f"Impossible de parser {filename}\n\n"
+                f"Raison: Aucun profil valide extrait\n"
+                f"DDSubset: {dd_subset}\n"
+                f"Profiles détectés: {len(structure_map.profiles)}\n"
+                f"Profiles avec données: 0\n\n"
+                f"Warnings:\n" + "\n".join(f"- {w}" for w in warnings) + "\n\n"
+                f"Suggestion: La structure XML a été détectée mais les données sont incomplètes.\n"
+                f"Vérifiez que le fichier contient des mesures valides dans les buffers."
+            )
+
+        return results
+
+    except ET.ParseError as e:
+        raise XMLParseException(
+            f"Impossible de parser {filename}\n\n"
+            f"Raison: XML malformé\n"
+            f"Erreur: {str(e)}\n\n"
+            f"Suggestion: Vérifiez l'intégrité du fichier XML."
+        )
+
+    except XMLParseException:
+        # Re-raise our custom exceptions
+        raise
+
+    except Exception as e:
+        raise XMLParseException(
+            f"Impossible de parser {filename}\n\n"
+            f"Raison: Erreur inattendue pendant la découverte de structure\n"
+            f"DDSubset: {dd_subset}\n"
+            f"Erreur: {type(e).__name__}: {str(e)}\n\n"
+            f"Suggestion: Structure XML non supportée automatiquement.\n"
+            f"Contactez le support technique avec ce fichier."
+        )
+
+
 def extract_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
     """Extrait les fichiers d'un ZIP."""
     files: List[Tuple[str, bytes]] = []
@@ -1962,10 +2797,12 @@ def create_zip_download(json_outputs: List[Dict]) -> bytes:
 def render_chart(
     data_list: List[ParsedMeterData],
     meter_id: str,
+    load_profile: str,
     obis_code: str
 ):
     """Affiche le graphique de courbe de charge avec Plotly."""
-    meter_data = next((d for d in data_list if d.meter_id == meter_id), None)
+    meter_data = next((d for d in data_list
+                       if d.meter_id == meter_id and d.load_profile == load_profile), None)
     
     if not meter_data or obis_code not in meter_data.channels:
         st.warning("Données non trouvées pour cette sélection")
@@ -2267,27 +3104,39 @@ def main():
     if st.session_state.processed_data:
         st.header("Visualisation")
 
-        meter_ids = [d.meter_id for d in st.session_state.processed_data]
+        # Créer des clés composites (meter_id, load_profile) pour distinguer les Load Profiles
+        meter_keys = [(d.meter_id, d.load_profile) for d in st.session_state.processed_data]
 
         col1, col2 = st.columns(2)
 
         with col1:
-            # Afficher le bon format selon le type de fichier
-            def format_meter_display(meter_id):
-                data = next((d for d in st.session_state.processed_data if d.meter_id == meter_id), None)
+            # Afficher le bon format selon le type de fichier avec LP si applicable
+            def format_meter_display(meter_key):
+                meter_id, load_profile = meter_key
+                data = next((d for d in st.session_state.processed_data
+                            if d.meter_id == meter_id and d.load_profile == load_profile), None)
+
+                # Extraire abréviation LP (LP1, LP2, etc.)
+                lp_abbrev = extract_lp_abbreviation(load_profile)
+                suffix = f" ({lp_abbrev})" if lp_abbrev else ""
+
                 if data and data.from_xml:
-                    return meter_id
-                return f"{st.session_state.mrid_prefix}{meter_id}"
-            
-            selected_meter = st.selectbox(
+                    return f"{meter_id}{suffix}"
+                return f"{st.session_state.mrid_prefix}{meter_id}{suffix}"
+
+            selected_meter_key = st.selectbox(
                 "Compteur",
-                options=meter_ids,
+                options=meter_keys,
                 format_func=format_meter_display
             )
 
+        # Extraire meter_id et load_profile depuis la clé composite
+        selected_meter_id, selected_load_profile = selected_meter_key
+
         channels: List[Tuple[str, str]] = []
         meter_data = next(
-            (d for d in st.session_state.processed_data if d.meter_id == selected_meter),
+            (d for d in st.session_state.processed_data
+             if d.meter_id == selected_meter_id and d.load_profile == selected_load_profile),
             None
         )
 
@@ -2312,10 +3161,11 @@ def main():
                 selected_obis = None
                 st.warning("Aucun canal disponible pour ce compteur")
         
-        if selected_meter and selected_obis:
+        if selected_meter_id and selected_obis:
             render_chart(
                 st.session_state.processed_data,
-                selected_meter,
+                selected_meter_id,
+                selected_load_profile,
                 selected_obis
             )
 
