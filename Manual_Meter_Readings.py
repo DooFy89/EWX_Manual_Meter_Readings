@@ -91,6 +91,9 @@ DST_OFFSETS = {
     8: "+02:00"
 }
 
+# Status register 0-0:96.10.1 bitmask (DST=0x08)
+STATUS_DST_BIT = 0x08
+
 # Unités nécessitant multiplication ×1000 (kWh → Wh, etc.)
 UNITS_MULTIPLY_1000 = ["kwh", "kw", "kvarh", "kvah"]
 
@@ -247,7 +250,7 @@ class ParsedMeterData:
     meter_id: str
     load_profile: str
     interval: str  # "15min" ou "24h"
-    channels: Dict[str, Dict[str, Any]]  # {obis: {"unit": str, "readings": [(ts, val, dst)]}}
+    channels: Dict[str, Dict[str, Any]]  # {obis: {"unit": str, "readings": [(ts, val, status)]}}
     source_file: str
     warnings: List[str] = field(default_factory=list)
     needs_user_input: List[str] = field(default_factory=list)
@@ -316,7 +319,7 @@ class StructureMap:
 class ReadingRow:
     """Une ligne de mesures avec timestamp."""
     timestamp: datetime
-    dst_value: int  # Valeur DST (0=STD, 8=DST)
+    dst_value: int  # Status bitmask (DST=0x08, PDN=0x80)
     values: Dict[str, float]  # OBIS code → valeur
 
 
@@ -363,11 +366,17 @@ def parse_dst_value(dst_string: Any) -> int:
     return int(match.group(1)) if match else 0
 
 
+def status_has_dst(status_value: int) -> bool:
+    return bool(status_value & STATUS_DST_BIT)
+
+
 def resolve_offset(dst_value: int, force_utc: bool = False) -> str:
     """Détermine l'offset à appliquer (+00:00 en UTC forcé, sinon offset DST local)."""
     if force_utc:
         return "+00:00"
-    return DST_OFFSETS.get(dst_value, "+01:00")
+    if status_has_dst(dst_value):
+        return DST_OFFSETS[8]
+    return DST_OFFSETS[0]
 
 
 def format_timestamp_iso(dt: datetime, dst_value: int, force_utc: bool = False) -> str:
@@ -407,6 +416,7 @@ def detect_delimiter(content: str) -> str:
     
     best_delim = ";"
     best_score = 0
+    obis_pattern = re.compile(r'\d-\d:\d+\.\d+\.\d+')
     
     for delim in CSV_DELIMITERS:
         try:
@@ -423,7 +433,13 @@ def detect_delimiter(content: str) -> str:
             avg = sum(col_counts) / len(col_counts)
             variance = sum((c - avg) ** 2 for c in col_counts) / len(col_counts)
             
-            score = avg / (1 + variance)
+            obis_cells = sum(
+                1
+                for row in rows
+                for cell in row
+                if obis_pattern.search(cell)
+            )
+            score = (avg / (1 + variance)) + (obis_cells * 0.5)
             
             if score > best_score and avg > 1:
                 best_score = score
@@ -549,7 +565,7 @@ def decode_dlms_timestamp(hex_string: str, force_utc: bool = False) -> Tuple[Opt
         
         dt = datetime(year, month, day, hour, minute, second)
         
-        dst_value = 8 if (status & 0x08) else 0
+        dst_value = 8 if status_has_dst(status) else 0
         
         if not force_utc and timezone_offset != 0x8000:
             if timezone_offset >= 0x8000:
@@ -1379,7 +1395,7 @@ def parse_csv_standard(lines: List[str], delimiter: str, filename: str) -> Parse
         warnings.append("Colonne timestamp non trouvée")
     
     _parse_data_rows(lines[3:], delimiter, col_map, channels, ts_idx, dst_idx)
-    
+
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
     detected_interval = detect_interval(all_timestamps, interval)
     
@@ -1447,7 +1463,7 @@ def parse_csv_heuristic(lines: List[str], delimiter: str, filename: str) -> Pars
         needs_input.append("timestamp_column")
     
     _parse_data_rows(lines[structure["data_start"]:], delimiter, col_map, channels, ts_idx, dst_idx)
-    
+
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
     if all_timestamps:
         interval = detect_interval(all_timestamps, interval if profile_name else None)
@@ -1469,6 +1485,95 @@ def parse_csv_heuristic(lines: List[str], delimiter: str, filename: str) -> Pars
     return ParseResult(data, confidence, "heuristic", list(set(needs_input)))
 
 
+def parse_csv_manual_config(
+    lines: List[str],
+    delimiter: str,
+    filename: str,
+    user_config: Dict[str, Any]
+) -> ParseResult:
+    """Parse un fichier CSV avec une configuration manuelle."""
+    warnings: List[str] = []
+    needs_input: List[str] = []
+
+    header_line = user_config.get("header_line")
+    data_start = user_config.get("data_start")
+    meter_id = str(user_config.get("meter_id", "")).strip()
+    interval = user_config.get("interval") or "15min"
+
+    if header_line is None or data_start is None:
+        return ParseResult(None, 0.0, "manual", ["structure"])
+
+    if header_line < 0 or header_line >= len(lines):
+        return ParseResult(None, 0.0, "manual", ["headers"])
+
+    if data_start < 0 or data_start >= len(lines):
+        return ParseResult(None, 0.0, "manual", ["data_start"])
+
+    if data_start <= header_line:
+        data_start = header_line + 1
+        if data_start >= len(lines):
+            return ParseResult(None, 0.0, "manual", ["data_start"])
+
+    if not meter_id or not re.match(r'^\d{6,}$', meter_id):
+        needs_input.append("meter_id")
+
+    profile_name = ""
+    if header_line > 0:
+        _, detected_profile, detected_interval = extract_load_profile(lines[header_line - 1])
+        if detected_profile:
+            profile_name = detected_profile
+        if detected_interval and detected_interval != interval:
+            warnings.append(
+                f"Intervalle detecte ({detected_interval}) different de la configuration ({interval})"
+            )
+
+    if not profile_name:
+        profile_name = f"Profil manuel ({interval})"
+
+    headers = [h.strip() for h in lines[header_line].split(delimiter)]
+    col_map, channels = _build_column_map(headers)
+
+    if not any(c["type"] == "data" for c in col_map.values()):
+        warnings.append("Headers sans codes OBIS, tentative de detection par contenu")
+        col_map, channels = _infer_columns_from_data(
+            headers,
+            lines[data_start:data_start + 10],
+            delimiter
+        )
+
+    ts_idx = next((i for i, c in col_map.items() if c["type"] == "timestamp"), None)
+    dst_idx = next((i for i, c in col_map.items() if c["type"] == "dst"), None)
+
+    if ts_idx is None:
+        needs_input.append("timestamp_column")
+
+    _parse_data_rows(lines[data_start:], delimiter, col_map, channels, ts_idx, dst_idx)
+
+    all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
+    if all_timestamps:
+        detected_interval = detect_interval(all_timestamps, interval)
+        if detected_interval != interval:
+            warnings.append(
+                f"Intervalle detecte ({detected_interval}) different de la configuration ({interval})"
+            )
+            interval = detected_interval
+
+    data = ParsedMeterData(
+        meter_id=meter_id,
+        load_profile=profile_name,
+        interval=interval,
+        channels=channels,
+        source_file=filename,
+        warnings=warnings
+    )
+
+    is_valid, problems = validate_parse_result(data)
+    needs_input.extend(problems)
+    confidence = 1.0 if is_valid else 0.6
+
+    return ParseResult(data, confidence, "manual", list(set(needs_input)))
+
+
 def parse_csv(file_bytes: bytes, filename: str, delimiter: str = ";", 
               user_config: Optional[Dict] = None) -> List[ParsedMeterData]:
     """Parse un fichier CSV avec stratégie adaptative."""
@@ -1478,20 +1583,25 @@ def parse_csv(file_bytes: bytes, filename: str, delimiter: str = ";",
     if not lines:
         return []
     
-    if delimiter == ";":
+    if delimiter == "auto":
         detected_delim = detect_delimiter(content)
     else:
         detected_delim = delimiter
     
-    result = parse_csv_standard(lines, detected_delim, filename)
-    
-    if result.confidence >= 0.8 and not result.needs_user_input:
-        return [result.data] if result.data else []
-    
-    fallback_result = parse_csv_heuristic(lines, detected_delim, filename)
-    
-    if fallback_result.confidence > result.confidence:
-        result = fallback_result
+    result: ParseResult
+
+    if user_config and "header_line" in user_config and "data_start" in user_config:
+        result = parse_csv_manual_config(lines, detected_delim, filename, user_config)
+    else:
+        result = parse_csv_standard(lines, detected_delim, filename)
+        
+        if result.confidence >= 0.8 and not result.needs_user_input:
+            return [result.data] if result.data else []
+        
+        fallback_result = parse_csv_heuristic(lines, detected_delim, filename)
+        
+        if fallback_result.confidence > result.confidence:
+            result = fallback_result
     
     if user_config and result.data:
         if "meter_id" in user_config and user_config["meter_id"]:
@@ -2608,7 +2718,7 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
         col_btn1, col_btn2 = st.columns(2)
         
         with col_btn1:
-            if st.button("✅ Appliquer", type="primary", key=f"apply_{filename}", use_container_width=True):
+            if st.button("Appliquer", type="primary", key=f"apply_{filename}", use_container_width=True):
                 if not meter_id or not re.match(r'^\d{6,}$', meter_id):
                     st.error("Le numéro de compteur doit contenir au moins 6 chiffres")
                     return None
@@ -2621,7 +2731,7 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
                 }
         
         with col_btn2:
-            if st.button("⏭️ Ignorer ce fichier", key=f"skip_{filename}", use_container_width=True):
+            if st.button("Ignorer ce fichier", key=f"skip_{filename}", use_container_width=True):
                 return {"skip": True}
     
     return None
@@ -3071,7 +3181,10 @@ def main():
                     
                     file_bytes = file_info["bytes"]
                     content = file_bytes.decode('utf-8', errors='replace')
-                    detected_delim = detect_delimiter(content)
+                    if delimiter == "auto":
+                        detected_delim = detect_delimiter(content)
+                    else:
+                        detected_delim = delimiter
                     
                     results = parse_csv(file_bytes, filename, detected_delim, config)
                     
