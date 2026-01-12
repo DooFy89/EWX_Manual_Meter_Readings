@@ -357,13 +357,33 @@ def parse_timestamp(ts_string: Any) -> Optional[datetime]:
     return None
 
 
+def parse_status_value(status_value: Any) -> Optional[int]:
+    if status_value is None:
+        return None
+
+    text = str(status_value).strip()
+    if not text:
+        return None
+
+    if re.fullmatch(r"0x[0-9a-fA-F]+", text):
+        return int(text, 16)
+
+    if re.fullmatch(r"[0-9a-fA-F]+", text):
+        if re.search(r"[a-fA-F]", text):
+            return int(text, 16)
+        return int(text, 10)
+
+    match = re.search(r"(\d+)", text)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
 def parse_dst_value(dst_string: Any) -> int:
-    """Extrait la valeur DST depuis une chaîne."""
-    if dst_string is None:
-        return 0
-    
-    match = re.search(r"(\d+)", str(dst_string).strip())
-    return int(match.group(1)) if match else 0
+    """Extrait la valeur de statut depuis une chaine."""
+    parsed = parse_status_value(dst_string)
+    return parsed if parsed is not None else 0
 
 
 def status_has_dst(status_value: int) -> bool:
@@ -405,8 +425,16 @@ def detect_interval(timestamps, fallback_interval: Optional[str] = None):
             return fallback_interval
         return "15min"
 
-    avg = sum(diffs) / len(diffs)
-    return "24h" if avg >= 82800 else "15min"
+    if len(diffs) < 3:
+        if fallback_interval in ("15min", "24h"):
+            return fallback_interval
+        avg = sum(diffs) / len(diffs)
+        return "24h" if avg >= 82800 else "15min"
+
+    rounded = [int(round(diff / 60.0)) * 60 for diff in diffs]
+    from collections import Counter
+    most_common_diff = Counter(rounded).most_common(1)[0][0]
+    return "24h" if most_common_diff >= 82800 else "15min"
 
 
 def detect_delimiter(content: str) -> str:
@@ -541,11 +569,29 @@ def obis_hex_to_readable(hex_obis: str) -> str:
         return hex_obis
 
 
+def extract_dlms_status(hex_string: str) -> Optional[int]:
+    if not hex_string or len(hex_string) != 24:
+        return None
+    try:
+        return int(hex_string[22:24], 16)
+    except ValueError:
+        return None
+
+
+def extract_dlms_timezone_offset(hex_string: str) -> Optional[int]:
+    if not hex_string or len(hex_string) != 24:
+        return None
+    try:
+        return int(hex_string[18:22], 16)
+    except ValueError:
+        return None
+
+
 def decode_dlms_timestamp(hex_string: str, force_utc: bool = False) -> Tuple[Optional[datetime], int]:
     """
     Décode un timestamp DLMS (OctetString 12 octets hex) en datetime.
     
-    Retourne: (datetime, dst_value)
+    Retourne: (datetime, status_value)
     """
     if not hex_string or len(hex_string) != 24:
         return None, 0
@@ -565,19 +611,20 @@ def decode_dlms_timestamp(hex_string: str, force_utc: bool = False) -> Tuple[Opt
         
         dt = datetime(year, month, day, hour, minute, second)
         
-        dst_value = 8 if status_has_dst(status) else 0
-        
+        status_value = status
+
         if not force_utc and timezone_offset != 0x8000:
             if timezone_offset >= 0x8000:
                 offset_minutes = timezone_offset - 0x10000
             else:
                 offset_minutes = timezone_offset
-            if offset_minutes == 120:
-                dst_value = 8
-            elif offset_minutes == 60:
-                dst_value = 0
+            abs_offset = abs(offset_minutes)
+            if abs_offset == 120:
+                status_value = status_value | STATUS_DST_BIT
+            elif abs_offset == 60:
+                status_value = status_value & ~STATUS_DST_BIT
         
-        return dt, dst_value
+        return dt, status_value
         
     except (ValueError, OverflowError):
         return None, 0
@@ -1084,6 +1131,10 @@ class DataPathResolver:
                                    capture_objects: Dict[int, str]) -> List[ReadingRow]:
         """Associe timestamps aux valeurs."""
         readings = []
+        status_idx = next(
+            (idx for idx, obis in capture_objects.items() if obis.startswith("0-0:96.10.1")),
+            None
+        )
 
         for row_idx in sorted(buffer_data.keys()):
             row_data = buffer_data[row_idx]
@@ -1093,10 +1144,15 @@ class DataPathResolver:
                 continue
 
             timestamp_hex = row_data[0]
-            dt, dst_val = decode_dlms_timestamp(timestamp_hex)
+            dt, status_val = decode_dlms_timestamp(timestamp_hex)
 
             if dt is None:
                 continue
+
+            if status_idx is not None and status_idx in row_data:
+                parsed_status = parse_status_value(row_data[status_idx])
+                if parsed_status is not None:
+                    status_val = parsed_status
 
             # Extraire valeurs pour chaque OBIS
             values = {}
@@ -1113,7 +1169,7 @@ class DataPathResolver:
             if values:
                 readings.append(ReadingRow(
                     timestamp=dt,
-                    dst_value=dst_val,
+                    dst_value=status_val,
                     values=values
                 ))
 
@@ -1988,6 +2044,13 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         warnings.append("capture_objects non trouvés dans le fichier XML")
         return []
 
+    status_col_idx = next(
+        (idx for idx, obis in capture_objects.items() if obis.startswith("0-0:96.10.1")),
+        None
+    )
+    status_mismatch_count = 0
+    status_mismatch_samples: List[Tuple[datetime, int, int]] = []
+
     # === 5. Initialiser les channels ===
     channels: Dict[str, Dict[str, Any]] = {}
 
@@ -2073,9 +2136,29 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
                     pass
             timezone_offset_checked = True
         
-        timestamp, dst_value = decode_dlms_timestamp(row_data[0], force_utc=timestamps_are_utc)
+        timestamp_status_raw = extract_dlms_status(row_data[0])
+        timestamp_offset_raw = extract_dlms_timezone_offset(row_data[0])
+        offset_defined = (
+            timestamp_offset_raw is not None and timestamp_offset_raw != 0x8000
+        )
+        timestamp, status_value = decode_dlms_timestamp(row_data[0], force_utc=timestamps_are_utc)
         if timestamp is None:
             continue
+
+        timestamp_status_effective = status_value
+
+        if status_col_idx is not None and status_col_idx in row_data:
+            parsed_status = parse_status_value(row_data[status_col_idx])
+            if parsed_status is not None:
+                if offset_defined and timestamp_status_raw is not None and (
+                    status_has_dst(parsed_status) != status_has_dst(timestamp_status_effective)
+                ):
+                    status_mismatch_count += 1
+                    if len(status_mismatch_samples) < 3:
+                        status_mismatch_samples.append(
+                            (timestamp, parsed_status, timestamp_status_effective)
+                        )
+                status_value = parsed_status
         
         for col_idx in range(2, max(row_data.keys()) + 1):
             if col_idx not in row_data:
@@ -2090,9 +2173,24 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
             
             try:
                 value = float(row_data[col_idx])
-                channels[obis]["readings"].append((timestamp, value, dst_value))
+                channels[obis]["readings"].append((timestamp, value, status_value))
             except (ValueError, TypeError):
                 pass
+
+    if status_mismatch_count:
+        sample_text = "; ".join(
+            f"{ts.strftime('%Y-%m-%d %H:%M:%S')}: "
+            f"capture={capture} (0x{capture:02X}) "
+            f"timestamp={ts_status} (0x{ts_status:02X})"
+            for ts, capture, ts_status in status_mismatch_samples
+        )
+        message = (
+            "DST mismatch (bit 0x08) 0-0:96.10.1 vs timestamp status "
+            f"(offset defini) on {status_mismatch_count} point(s)"
+        )
+        if sample_text:
+            message = f"{message}. Samples: {sample_text}"
+        warnings.append(message)
 
     # === 8. Vérifier qu'on a des données ===
     total_readings = sum(len(ch["readings"]) for ch in channels.values())
