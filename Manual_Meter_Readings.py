@@ -2091,7 +2091,6 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
     response_data: Dict[int, Dict[int, str]] = {}
     timestamp_field_type = ""
     timestamps_are_utc = True  # Par défaut, les payloads XML sont interprétés en UTC
-    timezone_offset_checked = False
 
     for field in root.iter():
         field_name = field.get("FieldName", "")
@@ -2118,24 +2117,39 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         warnings.append("Aucune donnée de mesure trouvée dans le buffer")
         return []
 
+    # Déterminer le mode timezone sur un ensemble de lignes (pas uniquement la première).
+    if not timestamp_field_type or "utc" not in timestamp_field_type.lower():
+        has_explicit_offset = False
+        has_status_hint = False
+
+        for row in sorted(response_data.keys()):
+            row_data = response_data[row]
+
+            if status_col_idx is not None and status_col_idx in row_data:
+                status_hint = parse_status_value(row_data[status_col_idx])
+                if status_hint is not None:
+                    has_status_hint = True
+
+            hex_ts = row_data.get(0)
+            if isinstance(hex_ts, str) and len(hex_ts) >= 22:
+                try:
+                    tz_raw = int(hex_ts[18:22], 16)
+                    if tz_raw != 0x8000:
+                        has_explicit_offset = True
+                        break
+                except ValueError:
+                    pass
+
+        if has_explicit_offset or has_status_hint:
+            timestamps_are_utc = False
+
     # === 7. Parser chaque ligne de données ===
     for row in sorted(response_data.keys()):
         row_data = response_data[row]
         
         if 0 not in row_data:
             continue
-        
-        if (not timezone_offset_checked) and (not timestamp_field_type or "utc" not in timestamp_field_type.lower()):
-            hex_ts = row_data[0]
-            if isinstance(hex_ts, str) and len(hex_ts) >= 22:
-                try:
-                    tz_raw = int(hex_ts[18:22], 16)
-                    if tz_raw != 0x8000:
-                        timestamps_are_utc = False
-                except ValueError:
-                    pass
-            timezone_offset_checked = True
-        
+
         timestamp_status_raw = extract_dlms_status(row_data[0])
         timestamp_offset_raw = extract_dlms_timezone_offset(row_data[0])
         offset_defined = (
