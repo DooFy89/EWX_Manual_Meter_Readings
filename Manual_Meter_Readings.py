@@ -2830,7 +2830,7 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
         col_btn1, col_btn2 = st.columns(2)
         
         with col_btn1:
-            if st.button("Appliquer", type="primary", key=f"apply_{filename}", use_container_width=True):
+            if st.button("Appliquer", type="primary", key=f"apply_{filename}", width="stretch"):
                 if not meter_id or not re.match(r'^\d{6,}$', meter_id):
                     st.error("Le numéro de compteur doit contenir au moins 6 chiffres")
                     return None
@@ -2843,7 +2843,7 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
                 }
         
         with col_btn2:
-            if st.button("Ignorer ce fichier", key=f"skip_{filename}", use_container_width=True):
+            if st.button("Ignorer ce fichier", key=f"skip_{filename}", width="stretch"):
                 return {"skip": True}
     
     return None
@@ -3097,13 +3097,13 @@ def render_chart(
         marker=dict(size=8, line=dict(width=2, color='white'))  # Marqueurs plus visibles
     )
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     
     with st.expander("Données du graphique", expanded=False):
         st.dataframe(
             df,
             height=300,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -3142,7 +3142,7 @@ def main():
     # === SIDEBAR: CONFIGURATION ===
     with st.sidebar:
         logo_b64 = base64.b64encode(LOGO_SVG.encode('utf-8')).decode('utf-8')
-        st.image(f"data:image/svg+xml;base64,{logo_b64}", use_column_width=True)
+        st.image(f"data:image/svg+xml;base64,{logo_b64}", width="stretch")
         
         st.header("Configuration")
         
@@ -3195,14 +3195,14 @@ def main():
             "Convertir",
             type="primary",
             disabled=not uploaded_files,
-            use_container_width=True
+            width="stretch"
         )
     
     with col2:
         if st.session_state.conversion_done:
             clear_btn = st.button(
                 "Effacer",
-                use_container_width=True
+                width="stretch"
             )
             if clear_btn:
                 st.session_state.processed_data = []
@@ -3344,7 +3344,7 @@ def main():
                 data=zip_data,
                 file_name=f"meter_readings_{timestamp_str}.zip",
                 mime="application/zip",
-                use_container_width=True
+                width="stretch"
             )
         
         with col2:
@@ -3445,7 +3445,7 @@ def main():
         if not summary_df.empty:
             st.dataframe(
                 summary_df,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
