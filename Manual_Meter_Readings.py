@@ -2016,17 +2016,23 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
                 break
 
     # Router vers la bonne fonction de parsing avec fallback flexible
+    failed_profiles: Dict[int, Tuple[str, List[str]]] = {}
     try:
         if dd_subset == "BillingValues":
             result = parse_xml_billing_values(file_bytes, filename)
         else:
             # Par défaut, traiter comme ProfileBuffer
-            result = parse_xml_profile_buffer(file_bytes, filename)
+            result = parse_xml_profile_buffer(file_bytes, filename, failed_profiles)
 
         # COUCHE 2: Fallback vers parser flexible si résultat vide
         if not result or (result and len(result[0].channels) == 0):
             # Parser existant n'a pas réussi, tenter découverte flexible
             result = parse_xml_flexible(file_bytes, filename, dd_subset or "ProfileBuffer")
+        elif failed_profiles:
+            # Une partie des profils détectés n'a rien donné : repli flexible pour ceux-là
+            result = recover_failed_xml_profiles(
+                file_bytes, filename, dd_subset or "ProfileBuffer", result, failed_profiles
+            )
 
         return result
 
@@ -2059,6 +2065,49 @@ XML_LOAD_PROFILES = {
 }
 
 
+def recover_failed_xml_profiles(
+    file_bytes: bytes,
+    filename: str,
+    dd_subset: str,
+    results: List[ParsedMeterData],
+    failed_profiles: Dict[int, Tuple[str, List[str]]],
+) -> List[ParsedMeterData]:
+    """
+    Repli flexible pour les profils détectés que le parser standard n'a pas pu lire.
+
+    Les profils déjà obtenus sont conservés tels quels ; un profil récupéré est identifié
+    par son nom (« Profil de charge N », voir ProfileDetector.detect_profile_name).
+    Un profil introuvable des deux côtés donne un avertissement sur le premier résultat.
+    """
+    try:
+        flexible_results = parse_xml_flexible(file_bytes, filename, dd_subset)
+        flexible_error = ""
+    except XMLParseException:
+        flexible_results = []
+        flexible_error = "parser flexible en échec"
+
+    by_name = {data.load_profile: data for data in flexible_results}
+    recovered: Dict[int, ParsedMeterData] = {}
+    for profile_num, (profile_name, reasons) in sorted(failed_profiles.items()):
+        data = by_name.get(profile_name)
+        if data is not None and data.channels:
+            recovered[profile_num] = data
+            continue
+        details = list(reasons) or ["aucune mesure"]
+        details.append(flexible_error or "profil non trouvé par le parser flexible")
+        results[0].warnings.append(
+            f"{profile_name} : aucune donnée exploitable ({'; '.join(details)})"
+        )
+
+    if not recovered:
+        return results
+
+    # Ordre des profils conservé (LP1 puis LP2)
+    order = {name: num for num, (name, _) in XML_LOAD_PROFILES.items()}
+    merged = results + list(recovered.values())
+    return sorted(merged, key=lambda data: order.get(data.load_profile, 0))
+
+
 def detect_xml_profile_numbers(root: ET.Element) -> List[int]:
     """Profils de charge présents : objet ProfileStatus_Load0N ou buffer DD.Profile_LoadN / Load0N."""
     status_pattern = re.compile(r"ProfileStatus_Load0?([12])(?!\d)")
@@ -2072,11 +2121,16 @@ def detect_xml_profile_numbers(root: ET.Element) -> List[int]:
     return sorted(found)
 
 
-def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
+def parse_xml_profile_buffer(
+    file_bytes: bytes,
+    filename: str,
+    failed_profiles: Optional[Dict[int, Tuple[str, List[str]]]] = None,
+) -> List[ParsedMeterData]:
     """
     Parse un fichier XML DLMS/COSEM de profil de charge (ProfileBuffer).
     Utilisé pour les fichiers E360, LGZ avec des séries temporelles.
     Retourne un ParsedMeterData par profil présent (LP1 et/ou LP2).
+    failed_profiles (optionnel) reçoit les profils sans résultat : numéro -> (nom, raisons).
     """
     warnings: List[str] = []
 
@@ -2184,12 +2238,15 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
 
     results = []
     for profile_num, profile_name, interval in profiles:
+        profile_warnings = list(warnings)
         data = parse_xml_load_profile(
             root, meter_id, filename, profile_num, profile_name, interval,
-            unit_map_from_scaler, list(warnings)
+            unit_map_from_scaler, profile_warnings
         )
         if data is not None:
             results.append(data)
+        elif failed_profiles is not None:
+            failed_profiles[profile_num] = (profile_name, profile_warnings[len(warnings):])
     return results
 
 
