@@ -520,6 +520,17 @@ def detect_interval(timestamps, fallback_interval: Optional[str] = None):
     return "24h" if most_common_diff >= 82800 else "15min"
 
 
+def resolve_interval(timestamps, declared: Optional[str], source: str, warnings: List[str]) -> str:
+    """Intervalle déclaré (profil du fichier, choix utilisateur) conservé, avec avertissement si les
+    données divergent ; sans déclaration, l'intervalle est déduit des données."""
+    if declared not in ("15min", "24h"):
+        return detect_interval(timestamps)
+    detected = detect_interval(timestamps, declared)
+    if detected != declared:
+        warnings.append(f"Intervalle détecté ({detected}) différent {source} ({declared}) : {declared} conservé")
+    return declared
+
+
 def detect_delimiter(content: str) -> str:
     """Détecte le délimiteur CSV le plus probable."""
     lines = content.split('\n')[:10]
@@ -582,12 +593,24 @@ def extract_obis_code(header: str) -> str:
     return match.group(1) if match else ""
 
 
+CANONICAL_BASE_UNITS = {"wh": "Wh", "varh": "varh", "vah": "VAh", "w": "W", "var": "var", "va": "VA"}
+
+
 def extract_unit(header: str) -> str:
-    """Extrait l'unité d'un header de colonne."""
-    match = re.search(r'\[(kWh|kvarh|kVAh)\]|\((kWh|kvarh|kVAh)\)', header, re.IGNORECASE)
+    """Extrait l'unité d'un header de colonne : [kWh], (MWh), (kvar), (W)... ; le préfixe garde sa casse (M ≠ m)."""
+    match = re.search(r'[\[(]\s*([kKMGm]?)(varh|vah|var|va|wh|w)\s*[\])]', header, re.IGNORECASE)
     if match:
-        return match.group(1) or match.group(2)
+        return match.group(1) + CANONICAL_BASE_UNITS[match.group(2).lower()]
     return ""
+
+
+def split_csv_line(line: str, delimiter: str) -> List[str]:
+    """Découpe une ligne CSV en cellules en interprétant les guillemets ("22/10/2026 12:00", "a;b")."""
+    try:
+        cells = next(csv.reader([line], delimiter=delimiter, skipinitialspace=True), [])
+    except csv.Error:
+        return line.split(delimiter)
+    return cells or [""]
 
 
 def extract_load_profile(line: str) -> Tuple[str, str, str]:
@@ -1318,7 +1341,7 @@ def extract_meter_id_smart(lines: List[str], filename: str, delimiter: str = ";"
     keywords = ['compteur', 'meter', 'serial', 'numéro', 'device', 'id', 'zähler', 'appareil']
     
     for idx, line in enumerate(lines[:20]):
-        cells = [c.strip().lower() for c in line.split(delimiter)]
+        cells = [c.strip().lower() for c in split_csv_line(line, delimiter)]
         for i, cell in enumerate(cells):
             if any(kw in cell for kw in keywords):
                 for j in range(max(0, i-1), min(len(cells), i+3)):
@@ -1359,7 +1382,7 @@ def detect_file_structure(lines: List[str], delimiter: str) -> Dict[str, Any]:
         if not line.strip():
             continue
             
-        cells = [c.strip() for c in line.split(delimiter)]
+        cells = [c.strip() for c in split_csv_line(line, delimiter)]
         num_cells = len([c for c in cells if c])
         
         obis_count = sum(1 for c in cells if re.search(r'\d-\d:\d+\.\d+\.\d+', c))
@@ -1459,24 +1482,46 @@ def _infer_columns_from_data(
         return col_map, channels
     
     num_cols = len(headers)
-    
+    header_map, _ = _build_column_map(headers)
+    rows = [split_csv_line(line, delimiter) for line in sample_lines]
+    columns = [[cells[i].strip() for cells in rows if i < len(cells)] for i in range(num_cols)]
+
+    def is_status_like(values: List[str]) -> bool:
+        # Statut sans en-tête ni DST/STD : petits entiers (≤ 255), au plus 3 valeurs distinctes, pas tous nuls
+        filled = [v for v in values if v]
+        return (
+            bool(filled)
+            and all(re.fullmatch(r'\d{1,3}', v) and int(v) <= 255 for v in filled)
+            and len(set(filled)) <= 3
+            and any(int(v) for v in filled)
+        )
+
+    def has_dst_suffix(values: List[str]) -> bool:
+        dst_count = sum(1 for v in values if re.match(r'^\d+\s*\(?(DST|STD)\)?$', v, re.I))
+        return bool(values) and dst_count > len(values) * 0.7
+
+    status_idx = next((i for i in range(num_cols) if header_map.get(i, {}).get("type") == "dst"), None)
+    if status_idx is None:
+        status_idx = next((i for i in range(num_cols) if has_dst_suffix(columns[i])), None)
+    if status_idx is None:
+        status_idx = next(
+            (i for i in range(num_cols)
+             if is_status_like(columns[i]) and not any(parse_timestamp(v) for v in columns[i])),
+            None
+        )
+
     for col_idx in range(num_cols):
-        values = []
-        for line in sample_lines:
-            cells = line.split(delimiter)
-            if col_idx < len(cells):
-                values.append(cells[col_idx].strip())
-        
+        values = columns[col_idx]
+
         timestamp_count = sum(1 for v in values if parse_timestamp(v))
         numeric_count = sum(1 for v in values if re.match(r'^[\d,.\-]+$', v) and v)
-        dst_count = sum(1 for v in values if re.match(r'^\d+\s*\(?(DST|STD)?\)?$', v, re.I))
-        
+
         total = len(values)
-        
+
         if total > 0:
             if timestamp_count > total * 0.7:
                 col_map[col_idx] = {"type": "timestamp", "obis": "", "unit": ""}
-            elif dst_count > total * 0.7:
+            elif col_idx == status_idx:
                 col_map[col_idx] = {"type": "dst", "obis": "", "unit": ""}
             elif numeric_count > total * 0.8:
                 header_clean = re.sub(r'[^\w]', '_', headers[col_idx])[:20]
@@ -1504,7 +1549,7 @@ def _parse_data_rows(
         if not line:
             continue
         
-        values = [v.strip() for v in line.split(delimiter)]
+        values = [v.strip() for v in split_csv_line(line, delimiter)]
         
         timestamp = None
         if ts_idx is not None and ts_idx < len(values):
@@ -1550,19 +1595,18 @@ def parse_csv_standard(lines: List[str], delimiter: str, filename: str) -> Parse
     if len(lines) < 4:
         return ParseResult(None, 0.0, "standard", ["structure"])
     
-    meter_id = lines[0].strip().replace('\ufeff', '')
+    meter_id = lines[0].strip().replace('\ufeff', '').strip('"').strip()
     
     if not re.match(r'^\d+$', meter_id):
         return ParseResult(None, 0.0, "standard", ["meter_id"])
     
-    obis_profile, profile_name, interval = extract_load_profile(lines[1])
-    
+    obis_profile, profile_name, declared_interval = extract_load_profile(lines[1])
+
     if not profile_name:
-        warnings.append("Profil de charge non détecté, utilisation par défaut: 15min")
-        profile_name = "Profil de charge 1"
-        interval = "15min"
+        warnings.append("Profil de charge non détecté, intervalle déduit des données")
+        declared_interval = None
     
-    headers = [h.strip() for h in lines[2].split(delimiter)]
+    headers = [h.strip() for h in split_csv_line(lines[2], delimiter)]
     
     if not any(re.search(r'\d-\d:\d+\.\d+\.\d+', h) for h in headers):
         return ParseResult(None, 0.3, "standard", ["headers"])
@@ -1577,12 +1621,10 @@ def parse_csv_standard(lines: List[str], delimiter: str, filename: str) -> Parse
     _parse_data_rows(lines[3:], delimiter, col_map, channels, ts_idx, dst_idx, warnings)
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
-    detected_interval = detect_interval(all_timestamps, interval)
-    
-    if detected_interval != interval:
-        warnings.append(f"Intervalle détecté ({detected_interval}) différent du profil ({interval})")
-        interval = detected_interval
-    
+    interval = resolve_interval(all_timestamps, declared_interval, "du profil déclaré", warnings)
+    if not profile_name:
+        profile_name = "Profil de charge 1" if interval == "15min" else "Profil de charge 2"
+
     data = ParsedMeterData(
         meter_id=meter_id,
         load_profile=profile_name,
@@ -1625,7 +1667,7 @@ def parse_csv_heuristic(lines: List[str], delimiter: str, filename: str) -> Pars
     if not profile_name:
         warnings.append("Profil non détecté, intervalle sera déduit des données")
     
-    headers = [h.strip() for h in lines[structure["header_line"]].split(delimiter)]
+    headers = [h.strip() for h in split_csv_line(lines[structure["header_line"]], delimiter)]
     col_map, channels = _build_column_map(headers)
     
     if not any(c["type"] == "data" for c in col_map.values()):
@@ -1645,9 +1687,8 @@ def parse_csv_heuristic(lines: List[str], delimiter: str, filename: str) -> Pars
     _parse_data_rows(lines[structure["data_start"]:], delimiter, col_map, channels, ts_idx, dst_idx, warnings)
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
-    if all_timestamps:
-        interval = detect_interval(all_timestamps, interval if profile_name else None)
-    
+    interval = resolve_interval(all_timestamps, interval if profile_name else None, "du profil déclaré", warnings)
+
     data = ParsedMeterData(
         meter_id=meter_id,
         load_profile=profile_name or f"Détecté: {interval}",
@@ -1678,7 +1719,7 @@ def parse_csv_manual_config(
     header_line = user_config.get("header_line")
     data_start = user_config.get("data_start")
     meter_id = str(user_config.get("meter_id", "")).strip()
-    interval = user_config.get("interval") or "15min"
+    declared_interval = user_config.get("interval") or None
 
     if header_line is None or data_start is None:
         return ParseResult(None, 0.0, "manual", ["structure"])
@@ -1699,18 +1740,17 @@ def parse_csv_manual_config(
 
     profile_name = ""
     if header_line > 0:
-        _, detected_profile, detected_interval = extract_load_profile(lines[header_line - 1])
+        _, detected_profile, profile_interval = extract_load_profile(lines[header_line - 1])
         if detected_profile:
             profile_name = detected_profile
-        if detected_interval and detected_interval != interval:
-            warnings.append(
-                f"Intervalle detecte ({detected_interval}) different de la configuration ({interval})"
-            )
+            if declared_interval is None:
+                declared_interval = profile_interval
+            elif profile_interval != declared_interval:
+                warnings.append(
+                    f"Intervalle du profil ({profile_interval}) different de la configuration ({declared_interval})"
+                )
 
-    if not profile_name:
-        profile_name = f"Profil manuel ({interval})"
-
-    headers = [h.strip() for h in lines[header_line].split(delimiter)]
+    headers = [h.strip() for h in split_csv_line(lines[header_line], delimiter)]
     col_map, channels = _build_column_map(headers)
 
     if not any(c["type"] == "data" for c in col_map.values()):
@@ -1730,13 +1770,9 @@ def parse_csv_manual_config(
     _parse_data_rows(lines[data_start:], delimiter, col_map, channels, ts_idx, dst_idx, warnings)
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
-    if all_timestamps:
-        detected_interval = detect_interval(all_timestamps, interval)
-        if detected_interval != interval:
-            warnings.append(
-                f"Intervalle detecte ({detected_interval}) different de la configuration ({interval})"
-            )
-            interval = detected_interval
+    interval = resolve_interval(all_timestamps, declared_interval, "de la configuration", warnings)
+    if not profile_name:
+        profile_name = f"Profil manuel ({interval})"
 
     data = ParsedMeterData(
         meter_id=meter_id,
@@ -1836,7 +1872,10 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
                 meter_id = cell_b.strip()
             elif "profil" in cell_a or "profile" in cell_a:
                 profile_name = cell_b.strip()
-                if "1" in profile_name:
+                _, known_profile, known_interval = extract_load_profile(profile_name)
+                if known_profile:
+                    interval = known_interval
+                elif "1" in profile_name:
                     interval = "15min"
                 elif "2" in profile_name:
                     interval = "24h"
@@ -1863,23 +1902,7 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         return []
     
     headers = [str(cell.value or "") for cell in data_sheet[1]]
-    
-    col_map: Dict[int, Dict[str, str]] = {}
-    channels: Dict[str, Dict[str, Any]] = {}
-    
-    for idx, header in enumerate(headers):
-        obis = extract_obis_code(header)
-        unit = extract_unit(header)
-        
-        header_lower = header.lower()
-        
-        if "0-0:1.0.0" in header or "horloge" in header_lower:
-            col_map[idx] = {"type": "timestamp", "obis": "", "unit": ""}
-        elif STATUS_REGISTER_PATTERN.search(header) or "état" in header_lower or "status" in header_lower:
-            col_map[idx] = {"type": "dst", "obis": "", "unit": ""}
-        elif obis:
-            col_map[idx] = {"type": "data", "obis": obis, "unit": unit}
-            channels[obis] = {"unit": unit, "readings": []}
+    col_map, channels = _build_column_map(headers)
     
     ts_idx = next((i for i, c in col_map.items() if c["type"] == "timestamp"), None)
     dst_idx = next((i for i, c in col_map.items() if c["type"] == "dst"), None)
@@ -1927,11 +1950,7 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         warnings.append(invalid_values_warning(invalid_count))
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
-    detected_interval = detect_interval(all_timestamps, interval)
-    
-    if detected_interval != interval:
-        warnings.append(f"Intervalle détecté ({detected_interval}) différent du profil ({interval})")
-        interval = detected_interval
+    interval = resolve_interval(all_timestamps, interval, "du profil déclaré", warnings)
     
     return [ParsedMeterData(
         meter_id=meter_id,
