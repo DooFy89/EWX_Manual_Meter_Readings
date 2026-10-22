@@ -15,6 +15,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import json
+import math
+import hashlib
 import uuid
 import re
 import csv
@@ -103,9 +105,6 @@ DLMS_CLOCK_STATUS_DST = 0x80
 
 # Fuseau des compteurs, utilisé quand l'horodatage ne dit rien de l'heure d'été
 LOCAL_TIMEZONE = ZoneInfo("Europe/Zurich")
-
-# Unités nécessitant multiplication ×1000 (kWh → Wh, etc.)
-UNITS_MULTIPLY_1000 = ["kwh", "kw", "kvarh", "kvah"]
 
 # Mapping OBIS → IEC
 # Clé: (code_obis, intervalle) → code_iec
@@ -389,6 +388,48 @@ def parse_status_value(status_value: Any) -> Optional[int]:
         return int(match.group(1))
 
     return None
+
+
+def parse_number(raw: Any) -> Optional[float]:
+    """
+    Nombre fini depuis une cellule : 1234.5, 1234,5, 1'234.5, 1 234,5, 1.234,5...
+    Retourne None si vide, non numérique, NaN ou infini.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    else:
+        text = str(raw).strip()
+        for separator in (" ", " ", " ", "'", "’"):
+            text = text.replace(separator, "")
+        if not text:
+            return None
+
+        if "," in text and "." in text:
+            # Le dernier séparateur est le séparateur décimal
+            if text.rfind(",") > text.rfind("."):
+                text = text.replace(".", "").replace(",", ".")
+            else:
+                text = text.replace(",", "")
+        elif text.count(",") > 1:
+            text = text.replace(",", "")
+        elif "," in text:
+            text = text.replace(",", ".")
+        elif text.count(".") > 1:
+            text = text.replace(".", "")
+
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+
+    return value if math.isfinite(value) else None
+
+
+def invalid_values_warning(count: int) -> str:
+    return f"{count} valeur(s) non numérique(s) ou non finie(s) ignorée(s)"
 
 
 def calendar_dst_status(local_dt: datetime) -> int:
@@ -693,21 +734,35 @@ def resolve_unit_from_scaler(quantity: str, scaler: int) -> str:
     base = base_units.get(quantity, "")
     if not base:
         return ""
+    return scaled_unit(base, scaler)
 
-    # En DLMS, Scaler = -3 → k
-    prefix_map = {
-        -3: "k",
-        -6: "M",
-        -9: "G"
-    }
 
+# Préfixes SI pour un scaler DLMS (valeur réelle = brute × 10^scaler)
+SCALER_PREFIXES = {3: "k", 6: "M", 9: "G", -3: "m"}
+UNIT_PREFIX_FACTORS = {"k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "m": 1e-3}
+BASE_UNITS = ("wh", "varh", "vah", "w", "var", "va")
+
+
+def scaled_unit(base_unit: str, scaler: int) -> str:
+    """Unité des valeurs brutes DLMS : Scaler = 3 → kWh, Scaler = -3 → mWh."""
     if scaler == 0:
-        return base
+        return base_unit
+    if scaler in SCALER_PREFIXES:
+        return f"{SCALER_PREFIXES[scaler]}{base_unit}"
+    return f"{base_unit}*10^{scaler}"
 
-    if scaler in prefix_map:
-        return f"{prefix_map[scaler]}{base}"
 
-    return f"{base}*10^{scaler}"
+def unit_to_base_multiplier(unit: str) -> float:
+    """Facteur pour exprimer une valeur en unité de base (Wh, varh, W...) ; 1 si unité inconnue."""
+    unit = (unit or "").strip()
+    match = re.fullmatch(r"(.+)\*10\^(-?\d+)", unit)
+    if match:
+        return unit_to_base_multiplier(match.group(1)) * 10 ** int(match.group(2))
+    if unit.lower() in BASE_UNITS:
+        return 1
+    if len(unit) > 1 and unit[0] in UNIT_PREFIX_FACTORS and unit[1:].lower() in BASE_UNITS:
+        return UNIT_PREFIX_FACTORS[unit[0]]
+    return 1
 
 
 # ============================================================================
@@ -748,13 +803,13 @@ class OBISCodeHandler:
             return resolve_unit_from_scaler(quantity, scaler)
 
         # Sinon, inférer depuis la structure OBIS
-        # Format: A-B:C.D.E ou A-B:C.D.E*F
+        # Format: A-B:C.D.E ou A-B:C.D.E*F → ["A", "B", "C.D.E"]
         parts = obis_code.replace('-', ':').split(':')
-        if len(parts) < 2:
+        if len(parts) < 3:
             return ""
 
         # Extraire le byte C (type de mesure)
-        c_parts = parts[1].split('.')
+        c_parts = parts[2].split('*')[0].split('.')
         if len(c_parts) < 2:
             return ""
 
@@ -774,14 +829,7 @@ class OBISCodeHandler:
 
             # Appliquer le scaler si disponible
             if scaler is not None:
-                if scaler == 0:
-                    return base_unit
-                elif scaler == -3:
-                    return f"k{base_unit}"
-                elif scaler == -6:
-                    return f"M{base_unit}"
-                else:
-                    return f"{base_unit}*10^{scaler}"
+                return scaled_unit(base_unit, scaler)
 
             return base_unit
 
@@ -808,10 +856,10 @@ class OBISCodeHandler:
 
         # Extraire le byte C
         parts = obis_code.replace('-', ':').split(':')
-        if len(parts) < 2:
+        if len(parts) < 3:
             return False
 
-        c_parts = parts[1].split('.')
+        c_parts = parts[2].split('*')[0].split('.')
         if len(c_parts) < 3:
             return False
 
@@ -848,10 +896,10 @@ class OBISCodeHandler:
 
         # Générer depuis la structure
         parts = obis_code.replace('-', ':').split(':')
-        if len(parts) < 2:
+        if len(parts) < 3:
             return obis_code
 
-        c_parts = parts[1].split('.')
+        c_parts = parts[2].split('*')[0].split('.')
         if len(c_parts) < 3:
             return obis_code
 
@@ -1211,10 +1259,9 @@ class DataPathResolver:
                     continue
 
                 if col_idx in row_data:
-                    try:
-                        values[obis_code] = float(row_data[col_idx])
-                    except (ValueError, TypeError):
-                        pass
+                    value = parse_number(row_data[col_idx])
+                    if value is not None:
+                        values[obis_code] = value
 
             if values:
                 readings.append(ReadingRow(
@@ -1434,6 +1481,7 @@ def _parse_data_rows(
 ) -> None:
     """Parse les lignes de données et remplit les channels."""
     calendar_count = 0
+    invalid_count = 0
     for line in data_lines:
         line = line.strip()
         if not line:
@@ -1463,16 +1511,19 @@ def _parse_data_rows(
             if not val_str:
                 continue
 
-            try:
-                value = float(val_str.replace(",", "."))
-                obis = col_info["obis"]
-                if obis in channels:
-                    channels[obis]["readings"].append((timestamp, value, dst_val))
-            except ValueError:
-                pass
+            value = parse_number(val_str)
+            if value is None:
+                invalid_count += 1
+                continue
+
+            obis = col_info["obis"]
+            if obis in channels:
+                channels[obis]["readings"].append((timestamp, value, dst_val))
 
     if calendar_count:
         warnings.append(calendar_fallback_warning(calendar_count))
+    if invalid_count:
+        warnings.append(invalid_values_warning(invalid_count))
 
 
 def parse_csv_standard(lines: List[str], delimiter: str, filename: str) -> ParseResult:
@@ -1774,7 +1825,11 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
                     interval = "24h"
     
     if not meter_id:
-        warnings.append("Numéro de série non trouvé dans l'onglet d'informations")
+        meter_id = extract_meter_id_smart([], filename)[0] or ""
+        if meter_id:
+            warnings.append(f"Numéro de série déduit du nom de fichier: {meter_id}")
+        else:
+            warnings.append("Numéro de série non trouvé dans l'onglet d'informations")
     
     data_sheet = None
     for name in wb.sheetnames:
@@ -1812,6 +1867,7 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
     ts_idx = next((i for i, c in col_map.items() if c["type"] == "timestamp"), None)
     dst_idx = next((i for i, c in col_map.items() if c["type"] == "dst"), None)
     calendar_count = 0
+    invalid_count = 0
 
     for row in data_sheet.iter_rows(min_row=2):
         timestamp = None
@@ -1837,22 +1893,21 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
                 continue
             
             cell_val = row[idx].value
-            if cell_val is None:
+            if cell_val is None or (isinstance(cell_val, str) and not cell_val.strip()):
                 continue
-            
-            try:
-                if isinstance(cell_val, str):
-                    value = float(cell_val.replace(",", "."))
-                else:
-                    value = float(cell_val)
-                
-                obis = col_info["obis"]
-                channels[obis]["readings"].append((timestamp, value, dst_val))
-            except (ValueError, TypeError):
-                pass
+
+            value = parse_number(cell_val)
+            if value is None:
+                invalid_count += 1
+                continue
+
+            obis = col_info["obis"]
+            channels[obis]["readings"].append((timestamp, value, dst_val))
 
     if calendar_count:
         warnings.append(calendar_fallback_warning(calendar_count))
+    if invalid_count:
+        warnings.append(invalid_values_warning(invalid_count))
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
     detected_interval = detect_interval(all_timestamps, interval)
@@ -2078,6 +2133,11 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         readable_obis = obis_hex_to_readable(hex_obis)
         unit_map_from_scaler[readable_obis] = unit
 
+    # Registres déclarés comme <Objects ObjectLogicalName=...> (ex: DD.EnergyRegister_A_import)
+    for obis, unit_info in XMLStructureExplorer(root).extract_units_from_registers().items():
+        if unit_info.resolved_unit:
+            unit_map_from_scaler.setdefault(obis, unit_info.resolved_unit)
+
     # === 4. Extraire les capture_objects ===
     capture_objects: Dict[int, str] = {}
 
@@ -2177,6 +2237,7 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
     # avec le statut DST résolu ligne par ligne (voir decode_dlms_timestamp).
     timestamps_are_utc = "utc" in timestamp_field_type.lower()
     calendar_count = 0
+    invalid_count = 0
     clock_status_disagreement_count = 0
     unsupported_deviations: set = set()
 
@@ -2225,11 +2286,17 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
             if obis not in channels:
                 continue
             
-            try:
-                value = float(row_data[col_idx])
-                channels[obis]["readings"].append((timestamp, value, status_value))
-            except (ValueError, TypeError):
-                pass
+            if not str(row_data[col_idx]).strip():
+                continue
+
+            value = parse_number(row_data[col_idx])
+            if value is None:
+                invalid_count += 1
+                continue
+            channels[obis]["readings"].append((timestamp, value, status_value))
+
+    if invalid_count:
+        warnings.append(invalid_values_warning(invalid_count))
 
     if status_mismatch_count:
         sample_text = "; ".join(
@@ -2394,11 +2461,7 @@ def parse_xml_billing_values(file_bytes: bytes, filename: str) -> List[ParsedMet
                 obis_hex = obis_match.group(1)
                 obis_readable = obis_hex_to_readable(obis_hex)
                 if obis_readable in registers:
-                    value_str = field.get("FieldValue", "")
-                    try:
-                        registers[obis_readable]["value"] = float(value_str)
-                    except (ValueError, TypeError):
-                        pass
+                    registers[obis_readable]["value"] = parse_number(field.get("FieldValue", ""))
             continue
 
         match_scaler = re.match(r"DD\.[\w_]+\.UnitScale\.0\.Scaler", field_name)
@@ -2686,7 +2749,7 @@ def parse_xml_flexible(file_bytes: bytes, filename: str, dd_subset: str) -> List
 
 
 def extract_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
-    """Extrait les fichiers d'un ZIP."""
+    """Extrait les fichiers d'un ZIP (chemin complet dans l'archive, pour éviter les homonymes)."""
     files: List[Tuple[str, bytes]] = []
     
     try:
@@ -2697,7 +2760,7 @@ def extract_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
                 
                 ext = get_file_extension(member)
                 if ext in ACCEPTED_DATA_EXTENSIONS:
-                    files.append((Path(member).name, zf.read(member)))
+                    files.append((member, zf.read(member)))
     except zipfile.BadZipFile:
         pass
     
@@ -2760,10 +2823,11 @@ def convert_to_json(data: ParsedMeterData, source: str, mrid_prefix: str) -> Opt
         if not iec_code:
             continue
         
-        unit = channel_data.get("unit", "").lower()
-        multiplier = 1000 if unit in UNITS_MULTIPLY_1000 else 1
+        multiplier = unit_to_base_multiplier(channel_data.get("unit", ""))
 
         for ts, value, dst in channel_data["readings"]:
+            if not math.isfinite(value):
+                continue
             formatted_ts = format_timestamp_iso(ts, dst, force_utc=data.timestamps_utc)
             converted_value = int(round(value * multiplier))
             
@@ -2906,6 +2970,34 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
     return None
 
 
+def file_config_key(name: str, file_bytes: bytes) -> str:
+    """Clé de configuration manuelle : nom + empreinte du contenu (deux fichiers homonymes restent distincts)."""
+    return f"{name}#{hashlib.sha1(file_bytes).hexdigest()[:12]}"
+
+
+def parse_uploaded_file(
+    name: str,
+    file_bytes: bytes,
+    delimiter: str,
+    user_config: Optional[Dict] = None
+) -> List[ParsedMeterData]:
+    """Parse un fichier de données selon son extension."""
+    ext = get_file_extension(name)
+
+    if ext == ".csv":
+        if delimiter == "auto":
+            delimiter = detect_delimiter(file_bytes.decode('utf-8', errors='replace'))
+        return parse_csv(file_bytes, name, delimiter, user_config)
+
+    if ext in [".xlsx", ".xls"]:
+        return parse_xlsx(file_bytes, name)
+
+    if ext == ".xml":
+        return parse_xml(file_bytes, name)
+
+    return []
+
+
 def process_uploaded_files(
     files: List,
     delimiter: str,
@@ -2916,117 +3008,63 @@ def process_uploaded_files(
     all_data: List[ParsedMeterData] = []
     all_warnings: List[str] = []
     files_needing_config: Dict = {}
-    
+
+    # === Inventaire des fichiers (contenu des ZIP inclus) ===
+    entries: List[Tuple[str, bytes]] = []
     for uploaded_file in files:
         file_bytes = uploaded_file.read()
         ext = get_file_extension(uploaded_file.name)
-        
-        # === ZIP ===
+
         if ext == ".zip":
             extracted = extract_zip(file_bytes)
-            
             if not extracted:
                 all_warnings.append(f"ZIP vide ou invalide: {uploaded_file.name}")
                 continue
-            
-            for inner_name, inner_bytes in extracted:
-                inner_ext = get_file_extension(inner_name)
-                
-                if inner_ext == ".csv":
-                    if delimiter == "auto":
-                        content = inner_bytes.decode('utf-8', errors='replace')
-                        detected_delim = detect_delimiter(content)
-                    else:
-                        detected_delim = delimiter
-                    
-                    user_config = st.session_state.user_configs.get(inner_name)
-                    results = parse_csv(inner_bytes, inner_name, detected_delim, user_config)
-                    
-                elif inner_ext in [".xlsx", ".xls"]:
-                    results = parse_xlsx(inner_bytes, inner_name)
-                    
-                elif inner_ext == ".xml":
-                    results = parse_xml(inner_bytes, inner_name)
-                else:
-                    continue
-                
-                for r in results:
-                    if r.needs_user_input:
-                        content = inner_bytes.decode('utf-8', errors='replace')
-                        files_needing_config[inner_name] = {
-                            "lines": content.split('\n'),
-                            "data": r,
-                            "bytes": inner_bytes
-                        }
-                    else:
-                        all_data.append(r)
-                        all_warnings.extend([f"{inner_name}: {w}" for w in r.warnings])
-                        
-                        missing = find_unmapped_obis(r)
-                        if missing:
-                            uniq_missing = ", ".join(sorted(set(missing)))
-                            all_warnings.append(f"{inner_name}: Codes OBIS non mappés pour {r.interval} (ignorés): {uniq_missing}")
-        
-        # === CSV ===
-        elif ext == ".csv":
-            if delimiter == "auto":
-                content = file_bytes.decode('utf-8', errors='replace')
-                detected_delim = detect_delimiter(content)
-            else:
-                detected_delim = delimiter
-            
-            user_config = st.session_state.user_configs.get(uploaded_file.name)
-            results = parse_csv(file_bytes, uploaded_file.name, detected_delim, user_config)
-            
-            for r in results:
-                if r.needs_user_input:
-                    content = file_bytes.decode('utf-8', errors='replace')
-                    files_needing_config[uploaded_file.name] = {
-                        "lines": content.split('\n'),
-                        "data": r,
-                        "bytes": file_bytes
-                    }
-                else:
-                    all_data.append(r)
-                    all_warnings.extend([f"{uploaded_file.name}: {w}" for w in r.warnings])
-                    
-                    missing = find_unmapped_obis(r)
-                    if missing:
-                        uniq_missing = ", ".join(sorted(set(missing)))
-                        all_warnings.append(f"{uploaded_file.name}: Codes OBIS non mappés pour {r.interval} (ignorés): {uniq_missing}")
-        
-        # === Excel ===
-        elif ext in [".xlsx", ".xls"]:
-            results = parse_xlsx(file_bytes, uploaded_file.name)
-            all_data.extend(results)
-            
-            for r in results:
-                all_warnings.extend([f"{uploaded_file.name}: {w}" for w in r.warnings])
-            
-            for r in results:
-                missing = find_unmapped_obis(r)
-                if missing:
-                    uniq_missing = ", ".join(sorted(set(missing)))
-                    all_warnings.append(f"{uploaded_file.name}: Codes OBIS non mappés pour {r.interval} (ignorés): {uniq_missing}")
-        
-        # === XML ===
-        elif ext == ".xml":
-            results = parse_xml(file_bytes, uploaded_file.name)
-            all_data.extend(results)
-            
-            for r in results:
-                all_warnings.extend([f"{uploaded_file.name}: {w}" for w in r.warnings])
-            
-            for r in results:
-                missing = find_unmapped_obis(r)
-                if missing:
-                    uniq_missing = ", ".join(sorted(set(missing)))
-                    all_warnings.append(f"{uploaded_file.name}: Codes OBIS non mappés pour {r.interval} (ignorés): {uniq_missing}")
-        
-        # === Format non supporté ===
+            entries.extend((f"{uploaded_file.name}/{member}", data) for member, data in extracted)
+        elif ext in ACCEPTED_DATA_EXTENSIONS:
+            entries.append((uploaded_file.name, file_bytes))
         else:
             all_warnings.append(f"Format non supporté: {uploaded_file.name}")
-    
+
+    # === Parsing : un fichier en erreur n'interrompt pas le lot ===
+    for name, file_bytes in entries:
+        config_key = file_config_key(name, file_bytes)
+
+        try:
+            results = parse_uploaded_file(
+                name, file_bytes, delimiter, st.session_state.user_configs.get(config_key)
+            )
+        except Exception as e:
+            all_warnings.append(f"{name}: fichier ignoré, lecture impossible - {e}")
+            continue
+
+        if not results:
+            all_warnings.append(f"{name}: aucune donnée exploitable, fichier ignoré")
+            continue
+
+        for r in results:
+            if r.needs_user_input and get_file_extension(name) == ".csv":
+                files_needing_config[name] = {
+                    "lines": file_bytes.decode('utf-8', errors='replace').split('\n'),
+                    "data": r,
+                    "bytes": file_bytes,
+                    "config_key": config_key
+                }
+                continue
+
+            all_warnings.extend([f"{name}: {w}" for w in r.warnings])
+
+            if not r.meter_id:
+                all_warnings.append(f"{name}: numéro de compteur introuvable, fichier non exporté")
+                continue
+
+            all_data.append(r)
+
+            missing = find_unmapped_obis(r)
+            if missing:
+                uniq_missing = ", ".join(sorted(set(missing)))
+                all_warnings.append(f"{name}: Codes OBIS non mappés pour {r.interval} (ignorés): {uniq_missing}")
+
     return all_data, all_warnings, files_needing_config
 
 
@@ -3346,7 +3384,7 @@ def main():
                     del st.session_state.files_needing_config[filename]
                     st.rerun()
                 else:
-                    st.session_state.user_configs[filename] = config
+                    st.session_state.user_configs[file_info["config_key"]] = config
                     
                     file_bytes = file_info["bytes"]
                     content = file_bytes.decode('utf-8', errors='replace')
