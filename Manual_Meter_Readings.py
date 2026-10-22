@@ -520,11 +520,13 @@ def detect_interval(timestamps, fallback_interval: Optional[str] = None):
     return "24h" if most_common_diff >= 82800 else "15min"
 
 
-def resolve_interval(timestamps, declared: Optional[str], source: str, warnings: List[str]) -> str:
+def resolve_interval(
+    timestamps, declared: Optional[str], source: str, warnings: List[str], fallback: Optional[str] = None
+) -> str:
     """Intervalle déclaré (profil du fichier, choix utilisateur) conservé, avec avertissement si les
-    données divergent ; sans déclaration, l'intervalle est déduit des données."""
+    données divergent ; sans déclaration, l'intervalle est déduit des données (repli : indice deviné)."""
     if declared not in ("15min", "24h"):
-        return detect_interval(timestamps)
+        return detect_interval(timestamps, fallback)
     detected = detect_interval(timestamps, declared)
     if detected != declared:
         warnings.append(f"Intervalle détecté ({detected}) différent {source} ({declared}) : {declared} conservé")
@@ -618,8 +620,9 @@ def extract_load_profile(line: str) -> Tuple[str, str, str]:
     obis_match = re.search(r'(\d-\d:\d+\.\d+\.\d+)', line)
     obis = obis_match.group(1) if obis_match else ""
     
-    profile_match = re.search(r'Profil de charge\s*(\d+)', line, re.IGNORECASE)
-    
+    # Numéro de profil isolé : « Load Profile 2021 » n'est pas un profil reconnu
+    profile_match = re.search(r'(?:Profil de charge|Load profile)\s*(\d{1,2})(?!\d)', line, re.IGNORECASE)
+
     if obis in LOAD_PROFILES:
         name, interval = LOAD_PROFILES[obis]
         return obis, name, interval
@@ -1467,9 +1470,18 @@ def _build_column_map(headers: List[str]) -> Tuple[Dict[int, Dict], Dict[str, Di
         obis = extract_obis_code(header)
         unit = extract_unit(header)
         
-        if "0-0:1.0.0" in header or re.search(r'horloge|timestamp|date.?time', header, re.IGNORECASE):
+        # Priorité : OBIS horloge/statut, puis OBIS de mesure (avant les mots-clés : « 1-0:1.8.0 - DST corrigé »
+        # reste une mesure), puis mots-clés horodatage/statut, puis tout autre OBIS
+        if "0-0:1.0.0" in header:
             col_map[idx] = {"type": "timestamp", "obis": "", "unit": ""}
-        elif STATUS_REGISTER_PATTERN.search(header) or re.search(r'état|status|dst', header, re.IGNORECASE):
+        elif STATUS_REGISTER_PATTERN.search(header):
+            col_map[idx] = {"type": "dst", "obis": "", "unit": ""}
+        elif obis and not obis.startswith("0-0:"):
+            col_map[idx] = {"type": "data", "obis": obis, "unit": unit}
+            channels[obis] = {"unit": unit, "readings": []}
+        elif re.search(r'horloge|timestamp|date.?time', header, re.IGNORECASE):
+            col_map[idx] = {"type": "timestamp", "obis": "", "unit": ""}
+        elif re.search(r'état|status|dst', header, re.IGNORECASE):
             col_map[idx] = {"type": "dst", "obis": "", "unit": ""}
         elif obis:
             col_map[idx] = {"type": "data", "obis": obis, "unit": unit}
@@ -1480,10 +1492,11 @@ def _build_column_map(headers: List[str]) -> Tuple[Dict[int, Dict], Dict[str, Di
 
 def _infer_columns_from_data(
     headers: List[str], 
-    sample_lines: List[str], 
-    delimiter: str
+    sample_lines: List[str],
+    delimiter: str,
+    warnings: Optional[List[str]] = None
 ) -> Tuple[Dict[int, Dict], Dict[str, Dict]]:
-    """Devine le type des colonnes en analysant les données."""
+    """Devine le type des colonnes en analysant les données (statut déduit signalé dans warnings)."""
     col_map: Dict[int, Dict] = {}
     channels: Dict[str, Dict] = {}
     
@@ -1512,11 +1525,18 @@ def _infer_columns_from_data(
     status_idx = next((i for i in range(num_cols) if header_map.get(i, {}).get("type") == "dst"), None)
     if status_idx is None:
         status_idx = next((i for i in range(num_cols) if has_dst_suffix(columns[i])), None)
+    status_guessed = False
     if status_idx is None:
         status_idx = next(
             (i for i in range(num_cols)
              if is_status_like(columns[i]) and not any(parse_timestamp(v) for v in columns[i])),
             None
+        )
+        status_guessed = status_idx is not None
+    if status_guessed and warnings is not None:
+        # Une mesure constante (ex. toujours 8) peut être prise pour un statut : choix rendu visible
+        warnings.append(
+            f"Colonne « {headers[status_idx]} » interprétée comme statut DST (déduction : petits entiers)"
         )
 
     for col_idx in range(num_cols):
@@ -1684,7 +1704,8 @@ def parse_csv_heuristic(lines: List[str], delimiter: str, filename: str) -> Pars
         col_map, channels = _infer_columns_from_data(
             headers, 
             lines[structure["data_start"]:structure["data_start"]+10],
-            delimiter
+            delimiter,
+            warnings
         )
     
     ts_idx = next((i for i, c in col_map.items() if c["type"] == "timestamp"), None)
@@ -1767,7 +1788,8 @@ def parse_csv_manual_config(
         col_map, channels = _infer_columns_from_data(
             headers,
             lines[data_start:data_start + 10],
-            delimiter
+            delimiter,
+            warnings
         )
 
     ts_idx = next((i for i, c in col_map.items() if c["type"] == "timestamp"), None)
@@ -1861,6 +1883,7 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
     meter_id = ""
     profile_name = ""
     interval = ""
+    interval_hint = None
     
     info_sheet = None
     for name in wb.sheetnames:
@@ -1882,12 +1905,13 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
             elif "profil" in cell_a or "profile" in cell_a:
                 profile_name = cell_b.strip()
                 _, known_profile, known_interval = extract_load_profile(profile_name)
+                # Seul un profil reconnu verrouille l'intervalle ; « 1 »/« 2 » dans le nom n'est qu'un repli
                 if known_profile:
                     interval = known_interval
                 elif "1" in profile_name:
-                    interval = "15min"
+                    interval_hint = "15min"
                 elif "2" in profile_name:
-                    interval = "24h"
+                    interval_hint = "24h"
     
     if not meter_id:
         meter_id = extract_meter_id_smart([], filename)[0] or ""
@@ -1959,7 +1983,7 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         warnings.append(invalid_values_warning(invalid_count))
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
-    interval = resolve_interval(all_timestamps, interval, "du profil déclaré", warnings)
+    interval = resolve_interval(all_timestamps, interval, "du profil déclaré", warnings, interval_hint)
     
     return [ParsedMeterData(
         meter_id=meter_id,
