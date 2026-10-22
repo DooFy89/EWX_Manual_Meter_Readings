@@ -615,6 +615,23 @@ def split_csv_line(line: str, delimiter: str) -> List[str]:
     return cells or [""]
 
 
+def unclosed_quotes_warning(lines: List[str]) -> Optional[str]:
+    """
+    Signale les lignes au nombre de guillemets impair : une valeur entre guillemets
+    qui s'étend sur plusieurs lignes n'est pas prise en charge (lignes découpées).
+    """
+    line_numbers = [idx + 1 for idx, line in enumerate(lines) if line.count('"') % 2]
+    if not line_numbers:
+        return None
+    listed = ", ".join(str(n) for n in line_numbers[:5])
+    if len(line_numbers) > 5:
+        listed += f"... ({len(line_numbers)} lignes)"
+    return (
+        f"Guillemets non refermés ligne(s) {listed} : une valeur sur plusieurs lignes "
+        "n'est pas prise en charge, les relevés concernés peuvent être ignorés"
+    )
+
+
 def extract_load_profile(line: str) -> Tuple[str, str, str]:
     """Extrait le profil de charge depuis la ligne 2 du CSV."""
     obis_match = re.search(r'(\d-\d:\d+\.\d+\.\d+)', line)
@@ -1839,6 +1856,7 @@ def parse_csv(file_bytes: bytes, filename: str, delimiter: str = ";",
         detected_delim = delimiter
     
     result: ParseResult
+    quotes_warning = unclosed_quotes_warning(lines)
 
     if user_config and "header_line" in user_config and "data_start" in user_config:
         result = parse_csv_manual_config(lines, detected_delim, filename, user_config)
@@ -1846,6 +1864,8 @@ def parse_csv(file_bytes: bytes, filename: str, delimiter: str = ";",
         result = parse_csv_standard(lines, detected_delim, filename)
         
         if result.confidence >= 0.8 and not result.needs_user_input:
+            if result.data and quotes_warning:
+                result.data.warnings.append(quotes_warning)
             return [result.data] if result.data else []
         
         fallback_result = parse_csv_heuristic(lines, detected_delim, filename)
@@ -1863,6 +1883,8 @@ def parse_csv(file_bytes: bytes, filename: str, delimiter: str = ";",
             result.data.interval = user_config["interval"]
     
     if result.data:
+        if quotes_warning:
+            result.data.warnings.append(quotes_warning)
         if result.needs_user_input:
             result.data.needs_user_input = result.needs_user_input
             result.data.warnings.append(

@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import Manual_Meter_Readings as m  # noqa: E402
 from test_audit_lot1 import export_values  # noqa: E402
 from test_lot2_csv import HEADER, build_csv, build_xlsx, daily_rows, quarter_rows  # noqa: E402
+from test_timezone import build_lp2_csv  # noqa: E402
 
 
 def xlsx_data(profile: str, base):
@@ -191,3 +192,23 @@ def test_extract_load_profile_requires_isolated_number(line, expected):
         assert name == ""
     else:
         assert interval == expected
+
+
+def test_unclosed_quotes_warning():
+    csv = build_lp2_csv([
+        ("25/11/2025 00:00:00", "0", "1"),
+        ("26/11/2025 00:00:00", "0", "2"),
+    ]).replace(b"26/11/2025 00:00:00 ; 0 ; 2 ; ", b'26/11/2025 00:00:00 ; 0 ; "2\nsuite" ; ')
+    data = m.parse_csv(csv, "multiligne.csv")[0]
+
+    assert any(w.startswith("Guillemets non refermés ligne(s) 5, 6 :") for w in data.warnings)
+
+
+def test_balanced_quotes_no_warning():
+    csv = build_lp2_csv([
+        ('"25/11/2025 00:00:00"', "0", '"1,5"'),
+        ("26/11/2025 00:00:00", "0", '"le ""bon"" index"'),
+    ])
+    data = m.parse_csv(csv, "guillemets.csv")[0]
+
+    assert not any("Guillemets non refermés" in w for w in data.warnings)
