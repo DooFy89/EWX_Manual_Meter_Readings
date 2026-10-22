@@ -390,10 +390,20 @@ def parse_status_value(status_value: Any) -> Optional[int]:
     return None
 
 
+def _join_thousands(text: str, separator: str) -> Optional[str]:
+    """Retire un séparateur de milliers ("1.234.567") ; None si les groupes sont invalides ("1,23,4")."""
+    sign = text[0] if text[:1] in ("+", "-") else ""
+    groups = text[len(sign):].split(separator)
+    if not 1 <= len(groups[0]) <= 3 or any(len(group) != 3 for group in groups[1:]):
+        return None
+    return sign + "".join(groups)
+
+
 def parse_number(raw: Any) -> Optional[float]:
     """
     Nombre fini depuis une cellule : 1234.5, 1234,5, 1'234.5, 1 234,5, 1.234,5...
-    Retourne None si vide, non numérique, NaN ou infini.
+    Une virgule seule est décimale ("1,234" = 1.234).
+    Retourne None si vide, non numérique, mal groupé, NaN ou infini.
     """
     if raw is None or isinstance(raw, bool):
         return None
@@ -402,24 +412,27 @@ def parse_number(raw: Any) -> Optional[float]:
         value = float(raw)
     else:
         text = str(raw).strip()
-        for separator in (" ", " ", " ", "'", "’"):
+        for separator in ("\u00a0", "\u202f", " ", "'", "\u2019"):
             text = text.replace(separator, "")
         if not text:
             return None
 
         if "," in text and "." in text:
             # Le dernier séparateur est le séparateur décimal
-            if text.rfind(",") > text.rfind("."):
-                text = text.replace(".", "").replace(",", ".")
-            else:
-                text = text.replace(",", "")
+            decimal_sep = "," if text.rfind(",") > text.rfind(".") else "."
+            thousands_sep = "." if decimal_sep == "," else ","
+            integer_part, fraction = text.rsplit(decimal_sep, 1)
+            integer_part = _join_thousands(integer_part, thousands_sep)
+            text = f"{integer_part}.{fraction}" if integer_part is not None else None
         elif text.count(",") > 1:
-            text = text.replace(",", "")
+            text = _join_thousands(text, ",")
         elif "," in text:
             text = text.replace(",", ".")
         elif text.count(".") > 1:
-            text = text.replace(".", "")
+            text = _join_thousands(text, ".")
 
+        if text is None:
+            return None
         try:
             value = float(text)
         except ValueError:
@@ -1201,6 +1214,7 @@ class DataPathResolver:
     def __init__(self, root: ET.Element, structure_map: StructureMap):
         self.root = root
         self.structure = structure_map
+        self.invalid_count = 0
 
     def extract_buffer_data(self, profile_name: str) -> Dict[int, Dict[int, str]]:
         """Extrait les données du buffer."""
@@ -1229,8 +1243,9 @@ class DataPathResolver:
 
     def match_timestamps_to_values(self, buffer_data: Dict[int, Dict[int, str]],
                                    capture_objects: Dict[int, str]) -> List[ReadingRow]:
-        """Associe timestamps aux valeurs."""
+        """Associe timestamps aux valeurs (self.invalid_count : valeurs non numériques écartées)."""
         readings = []
+        self.invalid_count = 0
         status_idx = next(
             (idx for idx, obis in capture_objects.items() if STATUS_REGISTER_PATTERN.match(obis)),
             None
@@ -1258,9 +1273,11 @@ class DataPathResolver:
                 if col_idx < 2:  # Skip timestamp et DST
                     continue
 
-                if col_idx in row_data:
+                if col_idx in row_data and str(row_data[col_idx]).strip():
                     value = parse_number(row_data[col_idx])
-                    if value is not None:
+                    if value is None:
+                        self.invalid_count += 1
+                    else:
                         values[obis_code] = value
 
             if values:
@@ -2697,6 +2714,8 @@ def parse_xml_flexible(file_bytes: bytes, filename: str, dd_subset: str) -> List
             calendar_count = sum(1 for row in reading_rows if row.dst_source == "calendar")
             if calendar_count:
                 profile_warnings.append(calendar_fallback_warning(calendar_count))
+            if resolver.invalid_count:
+                profile_warnings.append(invalid_values_warning(resolver.invalid_count))
 
             # === 4e. Créer ParsedMeterData ===
             results.append(ParsedMeterData(
@@ -2748,23 +2767,32 @@ def parse_xml_flexible(file_bytes: bytes, filename: str, dd_subset: str) -> List
         )
 
 
-def extract_zip(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
-    """Extrait les fichiers d'un ZIP (chemin complet dans l'archive, pour éviter les homonymes)."""
+def extract_zip(zip_bytes: bytes) -> Tuple[List[Tuple[str, bytes]], List[str]]:
+    """
+    Extrait les fichiers d'un ZIP (chemin complet dans l'archive, pour éviter les homonymes).
+
+    Retourne: (fichiers lus, membres illisibles)
+    """
     files: List[Tuple[str, bytes]] = []
-    
+    unreadable: List[str] = []
+
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
             for member in zf.namelist():
                 if member.endswith('/'):
                     continue
-                
+
                 ext = get_file_extension(member)
                 if ext in ACCEPTED_DATA_EXTENSIONS:
-                    files.append((member, zf.read(member)))
+                    try:
+                        files.append((member, zf.read(member)))
+                    except Exception:
+                        # Membre chiffré, corrompu ou compression non supportée
+                        unreadable.append(member)
     except zipfile.BadZipFile:
         pass
-    
-    return files
+
+    return files, unreadable
 
 
 def find_unmapped_obis(data: ParsedMeterData) -> List[str]:
@@ -2826,10 +2854,11 @@ def convert_to_json(data: ParsedMeterData, source: str, mrid_prefix: str) -> Opt
         multiplier = unit_to_base_multiplier(channel_data.get("unit", ""))
 
         for ts, value, dst in channel_data["readings"]:
-            if not math.isfinite(value):
+            scaled_value = value * multiplier
+            if not math.isfinite(scaled_value):
                 continue
             formatted_ts = format_timestamp_iso(ts, dst, force_utc=data.timestamps_utc)
-            converted_value = int(round(value * multiplier))
+            converted_value = int(round(scaled_value))
             
             interval_blocks.append({
                 "IntervalReadings": [
@@ -2891,8 +2920,14 @@ def init_session_state():
             st.session_state[key] = val
 
 
-def render_manual_config_ui(filename: str, preview_lines: List[str], current_data: Optional[ParsedMeterData] = None) -> Optional[Dict]:
+def render_manual_config_ui(
+    filename: str,
+    preview_lines: List[str],
+    current_data: Optional[ParsedMeterData] = None,
+    widget_key: str = ""
+) -> Optional[Dict]:
     """Affiche l'interface de configuration manuelle si nécessaire."""
+    widget_key = widget_key or filename
     st.warning(f"⚠️ Structure non reconnue automatiquement pour: **{filename}**")
     
     with st.expander("🔧 Configuration manuelle", expanded=True):
@@ -2914,16 +2949,16 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
                 "Numéro du compteur *",
                 value=default_meter,
                 help="Entrez le numéro de série du compteur (6-12 chiffres)",
-                key=f"meter_id_{filename}"
+                key=f"meter_id_{widget_key}"
             )
             
             header_line = st.number_input(
                 "Ligne des entêtes",
                 min_value=1,
-                max_value=len(preview_lines),
-                value=3,
+                max_value=max(len(preview_lines), 1),
+                value=min(3, max(len(preview_lines), 1)),
                 help="Numéro de la ligne contenant les noms de colonnes",
-                key=f"header_line_{filename}"
+                key=f"header_line_{widget_key}"
             )
         
         with col2:
@@ -2933,7 +2968,7 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
                 max_value=max(len(preview_lines), 4),
                 value=4,
                 help="Numéro de la première ligne contenant des mesures",
-                key=f"data_start_{filename}"
+                key=f"data_start_{widget_key}"
             )
             
             default_interval_idx = 0
@@ -2945,13 +2980,13 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
                 options=["15min", "24h"],
                 index=default_interval_idx,
                 help="Fréquence des relevés",
-                key=f"interval_{filename}"
+                key=f"interval_{widget_key}"
             )
         
         col_btn1, col_btn2 = st.columns(2)
         
         with col_btn1:
-            if st.button("Appliquer", type="primary", key=f"apply_{filename}", width="stretch"):
+            if st.button("Appliquer", type="primary", key=f"apply_{widget_key}", width="stretch"):
                 if not meter_id or not re.match(r'^\d{6,}$', meter_id):
                     st.error("Le numéro de compteur doit contenir au moins 6 chiffres")
                     return None
@@ -2964,7 +2999,7 @@ def render_manual_config_ui(filename: str, preview_lines: List[str], current_dat
                 }
         
         with col_btn2:
-            if st.button("Ignorer ce fichier", key=f"skip_{filename}", width="stretch"):
+            if st.button("Ignorer ce fichier", key=f"skip_{widget_key}", width="stretch"):
                 return {"skip": True}
     
     return None
@@ -2998,6 +3033,92 @@ def parse_uploaded_file(
     return []
 
 
+def parse_and_collect(
+    name: str,
+    file_bytes: bytes,
+    delimiter: str,
+    user_config: Optional[Dict],
+    all_data: List[ParsedMeterData],
+    all_warnings: List[str],
+    files_needing_config: Dict
+) -> None:
+    """
+    Parse un fichier et range le résultat : données exportables, avertissements,
+    ou demande de configuration manuelle (indexée par config_key).
+    """
+    config_key = file_config_key(name, file_bytes)
+
+    try:
+        results = parse_uploaded_file(name, file_bytes, delimiter, user_config)
+    except Exception as e:
+        all_warnings.append(f"{name}: fichier ignoré, lecture impossible - {e}")
+        return
+
+    if not results:
+        all_warnings.append(f"{name}: aucune donnée exploitable, fichier ignoré")
+        return
+
+    for r in results:
+        if r.needs_user_input and get_file_extension(name) == ".csv":
+            files_needing_config[config_key] = {
+                "name": name,
+                "lines": file_bytes.decode('utf-8', errors='replace').split('\n'),
+                "data": r,
+                "bytes": file_bytes
+            }
+            continue
+
+        all_warnings.extend([f"{name}: {w}" for w in r.warnings])
+
+        if not r.meter_id:
+            all_warnings.append(f"{name}: numéro de compteur introuvable, fichier non exporté")
+            continue
+
+        if not any(ch["readings"] for ch in r.channels.values()):
+            all_warnings.append(f"{name}: aucun relevé exploitable, fichier non exporté")
+            continue
+
+        all_data.append(r)
+
+        missing = find_unmapped_obis(r)
+        if missing:
+            uniq_missing = ", ".join(sorted(set(missing)))
+            all_warnings.append(f"{name}: Codes OBIS non mappés pour {r.interval} (ignorés): {uniq_missing}")
+
+
+def build_json_outputs(
+    data_list: List[ParsedMeterData],
+    source: str,
+    mrid_prefix: str
+) -> Tuple[List[Dict], List[str]]:
+    """Génère les JSON ; retourne aussi les fichiers BillingValues sans export."""
+    json_outputs: List[Dict] = []
+    billing_values_skipped: List[str] = []
+
+    for data in data_list:
+        result = convert_to_json(data, source, mrid_prefix)
+        if result is None:
+            # Aucune donnée à exporter pour ce compteur (IntervalBlocks vide)
+            # Probablement un fichier BillingValues
+            if data.load_profile == "Valeurs de facturation":
+                billing_values_skipped.append(data.source_file)
+            continue
+
+        doc, fname = result
+
+        # Pour XML, le mrid est déjà complet
+        display_mrid = data.meter_id if data.from_xml else f"{mrid_prefix}{data.meter_id}"
+
+        json_outputs.append({
+            "filename": fname,
+            "content": json.dumps(doc, indent=4, ensure_ascii=False),
+            "meter_id": data.meter_id,
+            "mrid": display_mrid
+        })
+
+    return json_outputs, billing_values_skipped
+
+
 def process_uploaded_files(
     files: List,
     delimiter: str,
@@ -3016,7 +3137,11 @@ def process_uploaded_files(
         ext = get_file_extension(uploaded_file.name)
 
         if ext == ".zip":
-            extracted = extract_zip(file_bytes)
+            extracted, unreadable = extract_zip(file_bytes)
+            all_warnings.extend(
+                f"{uploaded_file.name}/{member}: illisible dans le ZIP (chiffré ou corrompu), fichier ignoré"
+                for member in unreadable
+            )
             if not extracted:
                 all_warnings.append(f"ZIP vide ou invalide: {uploaded_file.name}")
                 continue
@@ -3028,42 +3153,10 @@ def process_uploaded_files(
 
     # === Parsing : un fichier en erreur n'interrompt pas le lot ===
     for name, file_bytes in entries:
-        config_key = file_config_key(name, file_bytes)
-
-        try:
-            results = parse_uploaded_file(
-                name, file_bytes, delimiter, st.session_state.user_configs.get(config_key)
-            )
-        except Exception as e:
-            all_warnings.append(f"{name}: fichier ignoré, lecture impossible - {e}")
-            continue
-
-        if not results:
-            all_warnings.append(f"{name}: aucune donnée exploitable, fichier ignoré")
-            continue
-
-        for r in results:
-            if r.needs_user_input and get_file_extension(name) == ".csv":
-                files_needing_config[name] = {
-                    "lines": file_bytes.decode('utf-8', errors='replace').split('\n'),
-                    "data": r,
-                    "bytes": file_bytes,
-                    "config_key": config_key
-                }
-                continue
-
-            all_warnings.extend([f"{name}: {w}" for w in r.warnings])
-
-            if not r.meter_id:
-                all_warnings.append(f"{name}: numéro de compteur introuvable, fichier non exporté")
-                continue
-
-            all_data.append(r)
-
-            missing = find_unmapped_obis(r)
-            if missing:
-                uniq_missing = ", ".join(sorted(set(missing)))
-                all_warnings.append(f"{name}: Codes OBIS non mappés pour {r.interval} (ignorés): {uniq_missing}")
+        parse_and_collect(
+            name, file_bytes, delimiter, st.session_state.user_configs.get(file_config_key(name, file_bytes)),
+            all_data, all_warnings, files_needing_config
+        )
 
     return all_data, all_warnings, files_needing_config
 
@@ -3322,32 +3415,7 @@ def main():
             st.session_state.warnings = warnings
             st.session_state.files_needing_config = files_needing_config
             
-            json_outputs = []
-            billing_values_skipped = []
-            for data in data_list:
-                result = convert_to_json(data, source, mrid_prefix)
-                if result is None:
-                    # Aucune donnée à exporter pour ce compteur (IntervalBlocks vide)
-                    # Probablement un fichier BillingValues
-                    if data.load_profile == "Valeurs de facturation":
-                        billing_values_skipped.append(data.source_file)
-                    continue
-
-                doc, fname = result
-
-                # Pour XML, le mrid est déjà complet
-                if data.from_xml:
-                    display_mrid = data.meter_id
-                else:
-                    display_mrid = f"{mrid_prefix}{data.meter_id}"
-
-                json_outputs.append({
-                    "filename": fname,
-                    "content": json.dumps(doc, indent=4, ensure_ascii=False),
-                    "meter_id": data.meter_id,
-                    "mrid": display_mrid
-                })
-            
+            json_outputs, billing_values_skipped = build_json_outputs(data_list, source, mrid_prefix)
             st.session_state.json_outputs = json_outputs
             st.session_state.conversion_done = True
 
@@ -3372,48 +3440,39 @@ def main():
     if st.session_state.files_needing_config:
         st.header("Configuration manuelle requise")
         
-        for filename, file_info in list(st.session_state.files_needing_config.items()):
+        for config_key, file_info in list(st.session_state.files_needing_config.items()):
+            filename = file_info["name"]
             config = render_manual_config_ui(
-                filename, 
-                file_info["lines"], 
-                file_info.get("data")
+                filename,
+                file_info["lines"],
+                file_info.get("data"),
+                widget_key=config_key
             )
-            
+
             if config:
                 if config.get("skip"):
-                    del st.session_state.files_needing_config[filename]
+                    del st.session_state.files_needing_config[config_key]
                     st.rerun()
                 else:
-                    st.session_state.user_configs[file_info["config_key"]] = config
-                    
-                    file_bytes = file_info["bytes"]
-                    content = file_bytes.decode('utf-8', errors='replace')
-                    if delimiter == "auto":
-                        detected_delim = detect_delimiter(content)
+                    st.session_state.user_configs[config_key] = config
+
+                    new_data: List[ParsedMeterData] = []
+                    new_warnings: List[str] = []
+                    still_needing: Dict = {}
+                    parse_and_collect(
+                        filename, file_info["bytes"], delimiter, config,
+                        new_data, new_warnings, still_needing
+                    )
+
+                    if still_needing:
+                        missing = ", ".join(still_needing[config_key]["data"].needs_user_input)
+                        st.error(f"Configuration insuffisante pour {filename} : {missing}")
                     else:
-                        detected_delim = delimiter
-                    
-                    results = parse_csv(file_bytes, filename, detected_delim, config)
-                    
-                    if results and not results[0].needs_user_input:
-                        st.session_state.processed_data.extend(results)
-
-                        for data in results:
-                            result = convert_to_json(data, source, mrid_prefix)
-                            if result is None:
-                                # Aucune donnée à exporter pour ce compteur (IntervalBlocks vide)
-                                continue
-
-                            doc, fname = result
-                            st.session_state.json_outputs.append({
-                                "filename": fname,
-                                "content": json.dumps(doc, indent=4, ensure_ascii=False),
-                                "meter_id": data.meter_id,
-                                "mrid": f"{mrid_prefix}{data.meter_id}"
-                            })
-                        
-                        del st.session_state.files_needing_config[filename]
-                        st.success(f"✅ {filename} traité avec succès!")
+                        new_outputs, _ = build_json_outputs(new_data, source, mrid_prefix)
+                        st.session_state.processed_data.extend(new_data)
+                        st.session_state.json_outputs.extend(new_outputs)
+                        st.session_state.warnings.extend(new_warnings)
+                        del st.session_state.files_needing_config[config_key]
                         st.rerun()
     
     # === AVERTISSEMENTS ===

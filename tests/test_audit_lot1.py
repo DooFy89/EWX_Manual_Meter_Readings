@@ -244,23 +244,109 @@ def test_manual_config_key_depends_on_content():
     assert m.file_config_key("releve.csv", b"a") == m.file_config_key("releve.csv", b"a")
 
 
-def test_manual_config_applied_by_content_key(session):
-    unknown_csv = b"releve sans entete\nHorloge;Valeur;Autre\n01/01/2026 00:00;1.5;2.5\n01/01/2026 00:15;3.5;4.5\n"
-    _, _, needing_config = m.process_uploaded_files(
-        [Upload("inconnu.csv", unknown_csv)], ";", "Landis", "ESR10307"
-    )
-    assert "inconnu.csv" in needing_config
+UNKNOWN_CSV = b"releve sans entete\nHorloge;Valeur;Autre\n01/01/2026 00:00;1.5;2.5\n01/01/2026 00:15;3.5;4.5\n"
+MANUAL_CONFIG = {"meter_id": "11223344", "header_line": 1, "data_start": 2, "interval": "15min"}
 
-    key = needing_config["inconnu.csv"]["config_key"]
-    session.user_configs[key] = {"meter_id": "11223344", "header_line": 1, "data_start": 2, "interval": "15min"}
+
+def test_manual_config_applied_by_content_key(session):
+    _, _, needing_config = m.process_uploaded_files(
+        [Upload("inconnu.csv", UNKNOWN_CSV)], ";", "Landis", "ESR10307"
+    )
+    key = m.file_config_key("inconnu.csv", UNKNOWN_CSV)
+    assert list(needing_config) == [key]
+    assert needing_config[key]["name"] == "inconnu.csv"
+
+    session.user_configs[key] = MANUAL_CONFIG
     data, _, needing_config = m.process_uploaded_files(
-        [Upload("inconnu.csv", unknown_csv)], ";", "Landis", "ESR10307"
+        [Upload("inconnu.csv", UNKNOWN_CSV)], ";", "Landis", "ESR10307"
     )
     assert not needing_config
     assert [d.meter_id for d in data] == ["11223344"]
 
     # Même nom, autre contenu : la configuration mémorisée ne s'applique pas
     _, _, needing_config = m.process_uploaded_files(
-        [Upload("inconnu.csv", unknown_csv.replace(b"1.5;2.5", b"5.5;6.5"))], ";", "Landis", "ESR10307"
+        [Upload("inconnu.csv", UNKNOWN_CSV.replace(b"1.5;2.5", b"5.5;6.5"))], ";", "Landis", "ESR10307"
     )
-    assert "inconnu.csv" in needing_config
+    assert len(needing_config) == 1
+
+
+def test_simultaneous_homonyms_needing_config_kept_apart(session):
+    other = UNKNOWN_CSV.replace(b"1.5;2.5", b"5.5;6.5")
+    _, _, needing_config = m.process_uploaded_files(
+        [Upload("inconnu.csv", UNKNOWN_CSV), Upload("inconnu.csv", other)], ";", "Landis", "ESR10307"
+    )
+
+    assert len(needing_config) == 2
+    assert {info["name"] for info in needing_config.values()} == {"inconnu.csv"}
+
+
+def test_parse_and_collect_manual_config_path():
+    """Chemin utilisé par la validation manuelle dans main()."""
+    data, warnings, still_needing = [], [], {}
+    m.parse_and_collect("inconnu.csv", UNKNOWN_CSV, ";", MANUAL_CONFIG, data, warnings, still_needing)
+
+    assert not still_needing
+    assert [d.meter_id for d in data] == ["11223344"]
+    outputs, _ = m.build_json_outputs(data, "Landis", "ESR10307")
+    assert outputs == []  # colonnes sans OBIS : rien d'exportable, pas de faux succès
+
+
+def test_file_without_readings_not_exported(session):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.active.title = "Informations"
+    wb.active.append(["Numéro de série", "12365275"])
+    sheet = wb.create_sheet("Données")
+    sheet.append(["Horloge 0-0:1.0.0", "1-0:1.8.0 (kWh)"])
+    sheet.append([datetime(2026, 1, 1, 0, 0), "abc"])
+    sheet.append([datetime(2026, 1, 1, 0, 15), "NaN"])
+    buffer = io.BytesIO()
+    wb.save(buffer)
+
+    data, warnings, _ = m.process_uploaded_files([Upload("vide.xlsx", buffer.getvalue())], ";", "Landis", "ESR10307")
+
+    assert data == []
+    assert any("2 valeur(s) non numérique(s)" in w for w in warnings)
+    assert any("vide.xlsx: aucun relevé exploitable, fichier non exporté" in w for w in warnings)
+
+
+def test_encrypted_zip_member_does_not_abort_batch(session):
+    archive = bytearray(build_zip([("chiffre.csv", b"x"), ("12365275-LP2.csv", CSV_OK)]))
+    # Marque le premier membre comme chiffré (bit 0 des flags, en-tête local et répertoire central)
+    local = archive.find(b"PK\x03\x04")
+    central = archive.find(b"PK\x01\x02")
+    archive[local + 6] |= 1
+    archive[central + 8] |= 1
+
+    data, warnings, _ = m.process_uploaded_files([Upload("lot.zip", bytes(archive))], ";", "Landis", "ESR10307")
+
+    assert [d.meter_id for d in data] == ["12365275"]
+    assert any("lot.zip/chiffre.csv: illisible dans le ZIP" in w for w in warnings)
+
+
+def test_export_skips_overflowing_values():
+    data = m.ParsedMeterData(
+        meter_id="12365275",
+        load_profile="Profil de charge 2",
+        interval="24h",
+        channels={"1-0:1.8.1": {"unit": "kWh", "readings": [
+            (datetime(2026, 1, 1), 1e308, 0),
+            (datetime(2026, 1, 2), 2.5, 0),
+        ]}},
+        source_file="x.csv",
+    )
+    assert export_values(data) == ["2500"]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("1,23,4", None),
+    ("12.34.5", None),
+    ("1.23,5", None),
+    ("1,234,567", 1234567.0),
+    ("-1.234,5", -1234.5),
+    ("-1,25e-3", -0.00125),
+    ("1,234", 1.234),  # virgule seule = décimale (convention des fichiers suisses)
+])
+def test_parse_number_grouping(raw, expected):
+    assert m.parse_number(raw) == expected
