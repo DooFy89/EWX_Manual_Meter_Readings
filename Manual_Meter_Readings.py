@@ -3290,9 +3290,11 @@ def create_summary_dataframe(
             if not has_mapping:
                 continue
             
-            # Ordre chronologique : à heure locale égale (heure doublée), l'heure d'été précède
+            # Ordre chronologique : instant réel (heure murale munie de l'offset propre à chaque lecture),
+            # pour que le changement d'heure ne fausse pas les bornes
             def chrono(r):
-                return (r[0], 0 if status_has_dst(r[2]) else 1)
+                offset = datetime.strptime(resolve_offset(r[2], data.timestamps_utc), "%z").tzinfo
+                return r[0].replace(tzinfo=offset)
             first = min(ch_data["readings"], key=chrono)
             last = max(ch_data["readings"], key=chrono)
 
@@ -3328,7 +3330,7 @@ def meter_display_name(data: ParsedMeterData, mrid_prefix: str) -> str:
 
 
 def dataset_labels(data_list: List[ParsedMeterData], mrid_prefix: str) -> List[str]:
-    """Libellés des jeux de données ; fichier source et période ajoutés en cas de doublon."""
+    """Libellés des jeux de données ; en cas de doublon, fichier source, période et au besoin un numéro."""
     labels = []
     for data in data_list:
         lp_abbrev = extract_lp_abbreviation(data.load_profile)
@@ -3338,8 +3340,17 @@ def dataset_labels(data_list: List[ParsedMeterData], mrid_prefix: str) -> List[s
     for i, data in enumerate(data_list):
         if labels[i] in duplicates:
             timestamps = [r[0] for ch in data.channels.values() for r in ch["readings"]]
-            period = f", {min(timestamps):%d.%m.%Y} - {max(timestamps):%d.%m.%Y}" if timestamps else ""
+            period = (
+                f", {min(timestamps):%d.%m.%Y %H:%M} - {max(timestamps):%d.%m.%Y %H:%M}" if timestamps else ""
+            )
             labels[i] = f"{labels[i]} - {data.source_file}{period}"
+
+    # Doublons restants (même fichier et même période) : numéro d'ordre à partir de la 2e occurrence
+    seen: Dict[str, int] = {}
+    for i, label in enumerate(labels):
+        seen[label] = seen.get(label, 0) + 1
+        if seen[label] > 1:
+            labels[i] = f"{label} (#{seen[label]})"
     return labels
 
 
