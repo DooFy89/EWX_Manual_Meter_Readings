@@ -25,6 +25,7 @@ import io
 import base64
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass, field
@@ -91,8 +92,17 @@ DST_OFFSETS = {
     8: "+02:00"
 }
 
-# Status register 0-0:96.10.1 bitmask (DST=0x08)
+# Status registers bitmask (DST=0x08) : 0-0:96.10.1 (LP1 15min), 0-0:96.10.2 (LP2 24h)
 STATUS_DST_BIT = 0x08
+STATUS_REGISTER_PATTERN = re.compile(r"0-0:96\.10\.[12](?![\d.])")
+
+# Horodatage DLMS (OctetString 12 octets) : déviation et clock status
+DLMS_DEVIATION_UNSPECIFIED = 0x8000
+DLMS_CLOCK_STATUS_UNSPECIFIED = 0xFF
+DLMS_CLOCK_STATUS_DST = 0x80
+
+# Fuseau des compteurs, utilisé quand l'horodatage ne dit rien de l'heure d'été
+LOCAL_TIMEZONE = ZoneInfo("Europe/Zurich")
 
 # Unités nécessitant multiplication ×1000 (kWh → Wh, etc.)
 UNITS_MULTIPLY_1000 = ["kwh", "kw", "kvarh", "kvah"]
@@ -321,6 +331,7 @@ class ReadingRow:
     timestamp: datetime
     dst_value: int  # Status bitmask (DST=0x08, PDN=0x80)
     values: Dict[str, float]  # OBIS code → valeur
+    dst_source: str = ""  # Source du statut DST (voir decode_dlms_timestamp)
 
 
 # ============================================================================
@@ -380,10 +391,28 @@ def parse_status_value(status_value: Any) -> Optional[int]:
     return None
 
 
-def parse_dst_value(dst_string: Any) -> int:
-    """Extrait la valeur de statut depuis une chaine."""
+def calendar_dst_status(local_dt: datetime) -> int:
+    """Statut DST (bit 0x08) déduit du calendrier Europe/Zurich pour une heure locale."""
+    return STATUS_DST_BIT if local_dt.replace(tzinfo=LOCAL_TIMEZONE).dst() else 0
+
+
+def parse_dst_value(dst_string: Any, local_dt: datetime) -> Tuple[int, bool]:
+    """
+    Extrait la valeur de statut depuis une chaine, sinon la déduit du calendrier.
+
+    Retourne: (status_value, repli_calendrier)
+    """
     parsed = parse_status_value(dst_string)
-    return parsed if parsed is not None else 0
+    if parsed is not None:
+        return parsed, False
+    return calendar_dst_status(local_dt), True
+
+
+def calendar_fallback_warning(count: int) -> str:
+    return (
+        f"Heure d'été inconnue sur {count} point(s) (pas de statut DST) : "
+        "offset déduit du calendrier Europe/Zurich"
+    )
 
 
 def status_has_dst(status_value: int) -> bool:
@@ -569,33 +598,50 @@ def obis_hex_to_readable(hex_obis: str) -> str:
         return hex_obis
 
 
-def extract_dlms_status(hex_string: str) -> Optional[int]:
+def dlms_deviation_minutes(hex_string: str) -> Optional[int]:
+    """Déviation signée (minutes) d'un timestamp DLMS, None si non spécifiée ou illisible."""
     if not hex_string or len(hex_string) != 24:
         return None
     try:
-        return int(hex_string[22:24], 16)
+        deviation = int(hex_string[18:22], 16)
     except ValueError:
         return None
-
-
-def extract_dlms_timezone_offset(hex_string: str) -> Optional[int]:
-    if not hex_string or len(hex_string) != 24:
+    if deviation == DLMS_DEVIATION_UNSPECIFIED:
         return None
-    try:
-        return int(hex_string[18:22], 16)
-    except ValueError:
-        return None
+    return deviation - 0x10000 if deviation >= 0x8000 else deviation
 
 
-def decode_dlms_timestamp(hex_string: str, force_utc: bool = False) -> Tuple[Optional[datetime], int]:
+def is_supported_dlms_deviation(offset_minutes: Optional[int]) -> bool:
+    return offset_minutes is None or abs(offset_minutes) in (0, 60, 120)
+
+
+def is_ambiguous_local_time(local_dt: datetime) -> bool:
+    """True pour l'heure répétée d'octobre ou l'heure inexistante de mars (Europe/Zurich)."""
+    return (
+        local_dt.replace(tzinfo=LOCAL_TIMEZONE, fold=0).utcoffset()
+        != local_dt.replace(tzinfo=LOCAL_TIMEZONE, fold=1).utcoffset()
+    )
+
+
+def decode_dlms_timestamp(
+    hex_string: str,
+    force_utc: bool = False,
+    column_status: Optional[int] = None
+) -> Tuple[Optional[datetime], int, str]:
     """
-    Décode un timestamp DLMS (OctetString 12 octets hex) en datetime.
-    
-    Retourne: (datetime, status_value)
+    Décode un timestamp DLMS (OctetString 12 octets hex) en datetime local.
+
+    Le statut DST (bit 0x08) est déterminé, par ordre de priorité :
+    1. "deviation"    : déviation explicite (0 = UTC converti en heure locale, ±60/±120 = hiver/été)
+    2. "column"       : registre de statut 0-0:96.10.x capturé dans le profil (column_status)
+    3. "clock_status" : octet clock status de l'horodatage (bit 0x80), s'il est renseigné
+    4. "calendar"     : calendrier Europe/Zurich
+
+    Retourne: (datetime, status_value, source)
     """
     if not hex_string or len(hex_string) != 24:
-        return None, 0
-    
+        return None, 0, ""
+
     try:
         year = int(hex_string[0:4], 16)
         month = int(hex_string[4:6], 16)
@@ -603,31 +649,37 @@ def decode_dlms_timestamp(hex_string: str, force_utc: bool = False) -> Tuple[Opt
         hour = int(hex_string[10:12], 16)
         minute = int(hex_string[12:14], 16)
         second = int(hex_string[14:16], 16)
-        timezone_offset = int(hex_string[18:22], 16)
-        status = int(hex_string[22:24], 16)
-        
-        if month == 0xFF or day == 0xFF:
-            return None, 0
-        
-        dt = datetime(year, month, day, hour, minute, second)
-        
-        status_value = status
+        clock_status = int(hex_string[22:24], 16)
 
-        if not force_utc and timezone_offset != 0x8000:
-            if timezone_offset >= 0x8000:
-                offset_minutes = timezone_offset - 0x10000
-            else:
-                offset_minutes = timezone_offset
-            abs_offset = abs(offset_minutes)
-            if abs_offset == 120:
-                status_value = status_value | STATUS_DST_BIT
-            elif abs_offset == 60:
-                status_value = status_value & ~STATUS_DST_BIT
-        
-        return dt, status_value
-        
+        if month == 0xFF or day == 0xFF:
+            return None, 0, ""
+
+        dt = datetime(year, month, day, hour, minute, second)
     except (ValueError, OverflowError):
-        return None, 0
+        return None, 0, ""
+
+    if force_utc:
+        return dt, 0, "utc"
+
+    offset_minutes = dlms_deviation_minutes(hex_string)
+    if offset_minutes is not None:
+        if offset_minutes == 0:
+            local_dt = dt.replace(tzinfo=timezone.utc).astimezone(LOCAL_TIMEZONE)
+            status_value = STATUS_DST_BIT if local_dt.dst() else 0
+            return local_dt.replace(tzinfo=None), status_value, "deviation"
+        if abs(offset_minutes) == 120:
+            return dt, STATUS_DST_BIT, "deviation"
+        if abs(offset_minutes) == 60:
+            return dt, 0, "deviation"
+
+    if column_status is not None:
+        return dt, column_status, "column"
+
+    if clock_status != DLMS_CLOCK_STATUS_UNSPECIFIED:
+        status_value = STATUS_DST_BIT if clock_status & DLMS_CLOCK_STATUS_DST else 0
+        return dt, status_value, "clock_status"
+
+    return dt, calendar_dst_status(dt), "calendar"
 
 
 def resolve_unit_from_scaler(quantity: str, scaler: int) -> str:
@@ -1132,7 +1184,7 @@ class DataPathResolver:
         """Associe timestamps aux valeurs."""
         readings = []
         status_idx = next(
-            (idx for idx, obis in capture_objects.items() if obis.startswith("0-0:96.10.1")),
+            (idx for idx, obis in capture_objects.items() if STATUS_REGISTER_PATTERN.match(obis)),
             None
         )
 
@@ -1143,16 +1195,14 @@ class DataPathResolver:
             if 0 not in row_data:
                 continue
 
-            timestamp_hex = row_data[0]
-            dt, status_val = decode_dlms_timestamp(timestamp_hex)
+            column_status = None
+            if status_idx is not None and status_idx in row_data:
+                column_status = parse_status_value(row_data[status_idx])
+
+            dt, status_val, dst_source = decode_dlms_timestamp(row_data[0], column_status=column_status)
 
             if dt is None:
                 continue
-
-            if status_idx is not None and status_idx in row_data:
-                parsed_status = parse_status_value(row_data[status_idx])
-                if parsed_status is not None:
-                    status_val = parsed_status
 
             # Extraire valeurs pour chaque OBIS
             values = {}
@@ -1170,7 +1220,8 @@ class DataPathResolver:
                 readings.append(ReadingRow(
                     timestamp=dt,
                     dst_value=status_val,
-                    values=values
+                    values=values,
+                    dst_source=dst_source
                 ))
 
         return readings
@@ -1322,7 +1373,7 @@ def _build_column_map(headers: List[str]) -> Tuple[Dict[int, Dict], Dict[str, Di
         
         if "0-0:1.0.0" in header or re.search(r'horloge|timestamp|date.?time', header, re.IGNORECASE):
             col_map[idx] = {"type": "timestamp", "obis": "", "unit": ""}
-        elif "0-0:96.10.1" in header or re.search(r'état|status|dst', header, re.IGNORECASE):
+        elif STATUS_REGISTER_PATTERN.search(header) or re.search(r'état|status|dst', header, re.IGNORECASE):
             col_map[idx] = {"type": "dst", "obis": "", "unit": ""}
         elif obis:
             col_map[idx] = {"type": "data", "obis": obis, "unit": unit}
@@ -1378,9 +1429,11 @@ def _parse_data_rows(
     col_map: Dict[int, Dict],
     channels: Dict[str, Dict],
     ts_idx: Optional[int],
-    dst_idx: Optional[int]
+    dst_idx: Optional[int],
+    warnings: List[str]
 ) -> None:
     """Parse les lignes de données et remplit les channels."""
+    calendar_count = 0
     for line in data_lines:
         line = line.strip()
         if not line:
@@ -1395,21 +1448,21 @@ def _parse_data_rows(
         if timestamp is None:
             continue
         
-        dst_val = 0
-        if dst_idx is not None and dst_idx < len(values):
-            dst_val = parse_dst_value(values[dst_idx])
-        
+        dst_raw = values[dst_idx] if dst_idx is not None and dst_idx < len(values) else None
+        dst_val, from_calendar = parse_dst_value(dst_raw, timestamp)
+        calendar_count += from_calendar
+
         for idx, col_info in col_map.items():
             if col_info["type"] != "data":
                 continue
-            
+
             if idx >= len(values):
                 continue
-            
+
             val_str = values[idx].strip()
             if not val_str:
                 continue
-            
+
             try:
                 value = float(val_str.replace(",", "."))
                 obis = col_info["obis"]
@@ -1417,6 +1470,9 @@ def _parse_data_rows(
                     channels[obis]["readings"].append((timestamp, value, dst_val))
             except ValueError:
                 pass
+
+    if calendar_count:
+        warnings.append(calendar_fallback_warning(calendar_count))
 
 
 def parse_csv_standard(lines: List[str], delimiter: str, filename: str) -> ParseResult:
@@ -1450,7 +1506,7 @@ def parse_csv_standard(lines: List[str], delimiter: str, filename: str) -> Parse
     if ts_idx is None:
         warnings.append("Colonne timestamp non trouvée")
     
-    _parse_data_rows(lines[3:], delimiter, col_map, channels, ts_idx, dst_idx)
+    _parse_data_rows(lines[3:], delimiter, col_map, channels, ts_idx, dst_idx, warnings)
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
     detected_interval = detect_interval(all_timestamps, interval)
@@ -1518,7 +1574,7 @@ def parse_csv_heuristic(lines: List[str], delimiter: str, filename: str) -> Pars
     if ts_idx is None:
         needs_input.append("timestamp_column")
     
-    _parse_data_rows(lines[structure["data_start"]:], delimiter, col_map, channels, ts_idx, dst_idx)
+    _parse_data_rows(lines[structure["data_start"]:], delimiter, col_map, channels, ts_idx, dst_idx, warnings)
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
     if all_timestamps:
@@ -1603,7 +1659,7 @@ def parse_csv_manual_config(
     if ts_idx is None:
         needs_input.append("timestamp_column")
 
-    _parse_data_rows(lines[data_start:], delimiter, col_map, channels, ts_idx, dst_idx)
+    _parse_data_rows(lines[data_start:], delimiter, col_map, channels, ts_idx, dst_idx, warnings)
 
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
     if all_timestamps:
@@ -1747,7 +1803,7 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         
         if "0-0:1.0.0" in header or "horloge" in header_lower:
             col_map[idx] = {"type": "timestamp", "obis": "", "unit": ""}
-        elif "0-0:96.10.1" in header or "état" in header_lower or "status" in header_lower:
+        elif STATUS_REGISTER_PATTERN.search(header) or "état" in header_lower or "status" in header_lower:
             col_map[idx] = {"type": "dst", "obis": "", "unit": ""}
         elif obis:
             col_map[idx] = {"type": "data", "obis": obis, "unit": unit}
@@ -1755,7 +1811,8 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
     
     ts_idx = next((i for i, c in col_map.items() if c["type"] == "timestamp"), None)
     dst_idx = next((i for i, c in col_map.items() if c["type"] == "dst"), None)
-    
+    calendar_count = 0
+
     for row in data_sheet.iter_rows(min_row=2):
         timestamp = None
         if ts_idx is not None and ts_idx < len(row):
@@ -1768,10 +1825,10 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         if timestamp is None:
             continue
         
-        dst_val = 0
-        if dst_idx is not None and dst_idx < len(row):
-            dst_val = parse_dst_value(str(row[dst_idx].value or ""))
-        
+        dst_raw = row[dst_idx].value if dst_idx is not None and dst_idx < len(row) else None
+        dst_val, from_calendar = parse_dst_value(dst_raw, timestamp)
+        calendar_count += from_calendar
+
         for idx, col_info in col_map.items():
             if col_info["type"] != "data":
                 continue
@@ -1793,7 +1850,10 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
                 channels[obis]["readings"].append((timestamp, value, dst_val))
             except (ValueError, TypeError):
                 pass
-    
+
+    if calendar_count:
+        warnings.append(calendar_fallback_warning(calendar_count))
+
     all_timestamps = [r[0] for ch in channels.values() for r in ch["readings"]]
     detected_interval = detect_interval(all_timestamps, interval)
     
@@ -2045,7 +2105,7 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         return []
 
     status_col_idx = next(
-        (idx for idx, obis in capture_objects.items() if obis.startswith("0-0:96.10.1")),
+        (idx for idx, obis in capture_objects.items() if STATUS_REGISTER_PATTERN.match(obis)),
         None
     )
     status_mismatch_count = 0
@@ -2090,7 +2150,6 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
 
     response_data: Dict[int, Dict[int, str]] = {}
     timestamp_field_type = ""
-    timestamps_are_utc = True  # Par défaut, les payloads XML sont interprétés en UTC
 
     for field in root.iter():
         field_name = field.get("FieldName", "")
@@ -2105,10 +2164,7 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
             
             if col == 0 and not timestamp_field_type and field_type:
                 timestamp_field_type = field_type
-                # Ne bascule en False que si un offset explicite est trouvé plus loin.
-                if "utc" in field_type.lower():
-                    timestamps_are_utc = True
-            
+
             if row not in response_data:
                 response_data[row] = {}
             response_data[row][col] = value
@@ -2117,63 +2173,47 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         warnings.append("Aucune donnée de mesure trouvée dans le buffer")
         return []
 
-    # Déterminer le mode timezone sur un ensemble de lignes (pas uniquement la première).
-    if not timestamp_field_type or "utc" not in timestamp_field_type.lower():
-        has_explicit_offset = False
-        has_status_hint = False
-
-        for row in sorted(response_data.keys()):
-            row_data = response_data[row]
-
-            if status_col_idx is not None and status_col_idx in row_data:
-                status_hint = parse_status_value(row_data[status_col_idx])
-                if status_hint is not None:
-                    has_status_hint = True
-
-            hex_ts = row_data.get(0)
-            if isinstance(hex_ts, str) and len(hex_ts) >= 22:
-                try:
-                    tz_raw = int(hex_ts[18:22], 16)
-                    if tz_raw != 0x8000:
-                        has_explicit_offset = True
-                        break
-                except ValueError:
-                    pass
-
-        if has_explicit_offset or has_status_hint:
-            timestamps_are_utc = False
+    # Horodatages en UTC seulement si le type du champ le déclare ; sinon heure locale,
+    # avec le statut DST résolu ligne par ligne (voir decode_dlms_timestamp).
+    timestamps_are_utc = "utc" in timestamp_field_type.lower()
+    calendar_count = 0
+    clock_status_disagreement_count = 0
+    unsupported_deviations: set = set()
 
     # === 7. Parser chaque ligne de données ===
     for row in sorted(response_data.keys()):
         row_data = response_data[row]
-        
+
         if 0 not in row_data:
             continue
 
-        timestamp_status_raw = extract_dlms_status(row_data[0])
-        timestamp_offset_raw = extract_dlms_timezone_offset(row_data[0])
-        offset_defined = (
-            timestamp_offset_raw is not None and timestamp_offset_raw != 0x8000
+        column_status = None
+        if status_col_idx is not None and status_col_idx in row_data:
+            column_status = parse_status_value(row_data[status_col_idx])
+
+        timestamp, status_value, status_source = decode_dlms_timestamp(
+            row_data[0], force_utc=timestamps_are_utc, column_status=column_status
         )
-        timestamp, status_value = decode_dlms_timestamp(row_data[0], force_utc=timestamps_are_utc)
         if timestamp is None:
             continue
 
-        timestamp_status_effective = status_value
+        deviation = dlms_deviation_minutes(row_data[0])
+        if not timestamps_are_utc and not is_supported_dlms_deviation(deviation):
+            unsupported_deviations.add(deviation)
 
-        if status_col_idx is not None and status_col_idx in row_data:
-            parsed_status = parse_status_value(row_data[status_col_idx])
-            if parsed_status is not None:
-                if offset_defined and timestamp_status_raw is not None and (
-                    status_has_dst(parsed_status) != status_has_dst(timestamp_status_effective)
-                ):
-                    status_mismatch_count += 1
-                    if len(status_mismatch_samples) < 3:
-                        status_mismatch_samples.append(
-                            (timestamp, parsed_status, timestamp_status_effective)
-                        )
-                status_value = parsed_status
-        
+        if status_source == "deviation" and column_status is not None and (
+            status_has_dst(column_status) != status_has_dst(status_value)
+        ):
+            status_mismatch_count += 1
+            if len(status_mismatch_samples) < 3:
+                status_mismatch_samples.append((timestamp, column_status, status_value))
+        elif status_source == "clock_status" and not is_ambiguous_local_time(timestamp) and (
+            status_has_dst(status_value) != status_has_dst(calendar_dst_status(timestamp))
+        ):
+            clock_status_disagreement_count += 1
+        elif status_source == "calendar":
+            calendar_count += 1
+
         for col_idx in range(2, max(row_data.keys()) + 1):
             if col_idx not in row_data:
                 continue
@@ -2199,12 +2239,28 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
             for ts, capture, ts_status in status_mismatch_samples
         )
         message = (
-            "DST mismatch (bit 0x08) 0-0:96.10.1 vs timestamp status "
-            f"(offset defini) on {status_mismatch_count} point(s)"
+            f"DST mismatch (bit 0x08) {capture_objects[status_col_idx]} vs timestamp deviation "
+            f"on {status_mismatch_count} point(s), deviation retenue"
         )
         if sample_text:
             message = f"{message}. Samples: {sample_text}"
         warnings.append(message)
+
+    if clock_status_disagreement_count:
+        warnings.append(
+            f"Heure d'été du clock status DLMS différente du calendrier Europe/Zurich "
+            f"sur {clock_status_disagreement_count} point(s) : clock status retenu"
+        )
+
+    if unsupported_deviations:
+        warnings.append(
+            "Déviation DLMS non prise en charge "
+            f"({', '.join(str(d) for d in sorted(unsupported_deviations))} min) : "
+            "heure murale conservée, offset déduit des autres sources"
+        )
+
+    if calendar_count:
+        warnings.append(calendar_fallback_warning(calendar_count))
 
     # === 8. Vérifier qu'on a des données ===
     total_readings = sum(len(ch["readings"]) for ch in channels.values())
@@ -2561,11 +2617,7 @@ def parse_xml_flexible(file_bytes: bytes, filename: str, dd_subset: str) -> List
                 readings = []
                 for row in reading_rows:
                     if obis in row.values:
-                        readings.append({
-                            "timestamp": row.timestamp,
-                            "value": row.values[obis],
-                            "dst": row.dst_value
-                        })
+                        readings.append((row.timestamp, row.values[obis], row.dst_value))
 
                 if readings:
                     channels[obis] = {
@@ -2578,6 +2630,11 @@ def parse_xml_flexible(file_bytes: bytes, filename: str, dd_subset: str) -> List
                 warnings.append(f"{profile_name}: Aucun channel avec données")
                 continue
 
+            profile_warnings = warnings.copy()
+            calendar_count = sum(1 for row in reading_rows if row.dst_source == "calendar")
+            if calendar_count:
+                profile_warnings.append(calendar_fallback_warning(calendar_count))
+
             # === 4e. Créer ParsedMeterData ===
             results.append(ParsedMeterData(
                 meter_id=meter_id,
@@ -2585,7 +2642,7 @@ def parse_xml_flexible(file_bytes: bytes, filename: str, dd_subset: str) -> List
                 interval=interval,
                 channels=channels,
                 source_file=filename,
-                warnings=warnings.copy(),
+                warnings=profile_warnings,
                 from_xml=True,
                 timestamps_utc=False
             ))

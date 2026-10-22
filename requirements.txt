@@ -4,3 +4,4 @@ openpyxl>=3.1.0
 plotly>=5.18.0
 pytz>=2023.3
 chardet>=5.2.0
+tzdata>=2024.1
