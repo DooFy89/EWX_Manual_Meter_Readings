@@ -615,12 +615,25 @@ def split_csv_line(line: str, delimiter: str) -> List[str]:
     return cells or [""]
 
 
-def unclosed_quotes_warning(lines: List[str]) -> Optional[str]:
+def ends_inside_quoted_field(line: str, delimiter: str) -> bool:
+    """True si la ligne se termine à l'intérieur d'une valeur entre guillemets (syntaxe csv)."""
+    try:
+        next(csv.reader([line], delimiter=delimiter, skipinitialspace=True, strict=True), None)
+    except csv.Error as e:
+        return "unexpected end of data" in str(e)
+    return False
+
+
+def unclosed_quotes_warning(lines: List[str], delimiter: str) -> Optional[str]:
     """
-    Signale les lignes au nombre de guillemets impair : une valeur entre guillemets
-    qui s'étend sur plusieurs lignes n'est pas prise en charge (lignes découpées).
+    Signale les lignes qui se terminent dans une valeur entre guillemets : une valeur
+    sur plusieurs lignes n'est pas prise en charge (lignes découpées). Numéros de ligne
+    physiques : passer les lignes du fichier non tronqué.
     """
-    line_numbers = [idx + 1 for idx, line in enumerate(lines) if line.count('"') % 2]
+    line_numbers = [
+        idx + 1 for idx, line in enumerate(lines)
+        if '"' in line and ends_inside_quoted_field(line, delimiter)
+    ]
     if not line_numbers:
         return None
     listed = ", ".join(str(n) for n in line_numbers[:5])
@@ -1856,7 +1869,7 @@ def parse_csv(file_bytes: bytes, filename: str, delimiter: str = ";",
         detected_delim = delimiter
     
     result: ParseResult
-    quotes_warning = unclosed_quotes_warning(lines)
+    quotes_warning = unclosed_quotes_warning(content.split('\n'), detected_delim)
 
     if user_config and "header_line" in user_config and "data_start" in user_config:
         result = parse_csv_manual_config(lines, detected_delim, filename, user_config)

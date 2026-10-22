@@ -201,7 +201,7 @@ def test_unclosed_quotes_warning():
     ]).replace(b"26/11/2025 00:00:00 ; 0 ; 2 ; ", b'26/11/2025 00:00:00 ; 0 ; "2\nsuite" ; ')
     data = m.parse_csv(csv, "multiligne.csv")[0]
 
-    assert any(w.startswith("Guillemets non refermés ligne(s) 5, 6 :") for w in data.warnings)
+    assert any(w.startswith("Guillemets non refermés ligne(s) 5 :") for w in data.warnings)
 
 
 def test_balanced_quotes_no_warning():
@@ -210,5 +210,35 @@ def test_balanced_quotes_no_warning():
         ("26/11/2025 00:00:00", "0", '"le ""bon"" index"'),
     ])
     data = m.parse_csv(csv, "guillemets.csv")[0]
+
+    assert not any("Guillemets non refermés" in w for w in data.warnings)
+
+
+@pytest.mark.parametrize("line, expected", [
+    ('12";"début', True),       # 2 guillemets, mais la 2e valeur reste ouverte
+    ('fin";12"', False),
+    ('a;"b', True),
+    ('12";3', False),           # guillemet littéral dans une valeur non citée
+    ('a;"b ""x"" c";d', False),
+    ('"25/11/2025";0;"1,5"', False),
+    ('', False),
+])
+def test_ends_inside_quoted_field(line, expected):
+    assert m.ends_inside_quoted_field(line, ";") == expected
+
+
+def test_unclosed_quotes_line_numbers_count_leading_blank_lines():
+    csv = b"\n\n" + build_lp2_csv([
+        ("25/11/2025 00:00:00", "0", "1"),
+        ("26/11/2025 00:00:00", "0", '"2'),
+    ])
+    data = m.parse_csv(csv, "decale.csv")[0]
+
+    assert any(w.startswith("Guillemets non refermés ligne(s) 7 :") for w in data.warnings)
+
+
+def test_literal_quote_no_false_positive():
+    csv = build_lp2_csv([("25/11/2025 00:00:00", "0", '12"')])
+    data = m.parse_csv(csv, "pouce.csv")[0]
 
     assert not any("Guillemets non refermés" in w for w in data.warnings)
