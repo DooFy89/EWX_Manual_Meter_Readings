@@ -620,8 +620,11 @@ def extract_load_profile(line: str) -> Tuple[str, str, str]:
     obis_match = re.search(r'(\d-\d:\d+\.\d+\.\d+)', line)
     obis = obis_match.group(1) if obis_match else ""
     
-    # Numéro de profil isolé : « Load Profile 2021 » n'est pas un profil reconnu
-    profile_match = re.search(r'(?:Profil de charge|Load profile)\s*(\d{1,2})(?!\d)', line, re.IGNORECASE)
+    # Numéro de profil isolé : « Load Profile 2021 », « 2A » ou « 2.1 » ne sont pas reconnus
+    profile_match = re.search(
+        r'(?:Profil de charge|Load profile)\s*(\d{1,2})(?=$|[\s,;:()\[\]/_-]|\u2013|\u2014)',
+        line, re.IGNORECASE
+    )
 
     if obis in LOAD_PROFILES:
         name, interval = LOAD_PROFILES[obis]
@@ -2052,6 +2055,12 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
         if not result or (result and len(result[0].channels) == 0):
             # Parser existant n'a pas réussi, tenter découverte flexible
             result = parse_xml_flexible(file_bytes, filename, dd_subset or "ProfileBuffer")
+            found = {data.load_profile for data in result if data.channels}
+            for profile_name, reasons in failed_profiles.values():
+                if profile_name not in found:
+                    result[0].warnings.append(
+                        missing_profile_warning(profile_name, reasons, "profil non trouvé par le parser flexible")
+                    )
         elif failed_profiles:
             # Une partie des profils détectés n'a rien donné : repli flexible pour ceux-là
             result = recover_failed_xml_profiles(
@@ -2089,6 +2098,12 @@ XML_LOAD_PROFILES = {
 }
 
 
+def missing_profile_warning(profile_name: str, reasons: List[str], flexible_outcome: str) -> str:
+    details = list(reasons) or ["aucune mesure"]
+    details.append(flexible_outcome)
+    return f"{profile_name} : aucune donnée exploitable ({'; '.join(details)})"
+
+
 def recover_failed_xml_profiles(
     file_bytes: bytes,
     filename: str,
@@ -2117,11 +2132,9 @@ def recover_failed_xml_profiles(
         if data is not None and data.channels:
             recovered[profile_num] = data
             continue
-        details = list(reasons) or ["aucune mesure"]
-        details.append(flexible_error or "profil non trouvé par le parser flexible")
-        results[0].warnings.append(
-            f"{profile_name} : aucune donnée exploitable ({'; '.join(details)})"
-        )
+        results[0].warnings.append(missing_profile_warning(
+            profile_name, reasons, flexible_error or "profil non trouvé par le parser flexible"
+        ))
 
     if not recovered:
         return results

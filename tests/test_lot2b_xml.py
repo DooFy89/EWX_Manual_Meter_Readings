@@ -98,3 +98,18 @@ def test_standard_file_does_not_call_flexible_parser(monkeypatch):
     expected = m.parse_xml_profile_buffer(xml, "LP1_LP2.xml")
     assert [d.load_profile for d in results] == ["Profil de charge 1", "Profil de charge 2"]
     assert [(d.channels, d.warnings) for d in results] == [(d.channels, d.warnings) for d in expected]
+
+
+def test_all_standard_failures_still_report_missing_profile():
+    # LP1 illisible partout, LP2 lisible seulement par le flexible : le repli global
+    # récupère LP2 et doit signaler LP1
+    xml = build_xml({
+        1: ([], LP1_ROWS, 0),
+        2: ([CLOCK, A_PLUS_T1], LP2_ROWS, 1),
+    })
+    results = m.parse_xml(xml, "lp1_vide_lp2_flexible.xml")
+
+    assert [d.load_profile for d in results] == ["Profil de charge 2"]
+    assert values(results[0], "1-0:1.8.1") == [5000, 5100]
+    [warning] = [w for w in results[0].warnings if "aucune donnée exploitable" in w]
+    assert warning.startswith("Profil de charge 1 : ")

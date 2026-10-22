@@ -175,3 +175,19 @@ def test_csv_comma_delimiter_quoted_decimal():
 
     assert [r[1] for r in data.channels["1-0:1.8.0"]["readings"]] == [1.5]
     assert export_values(data) == ["1500"]  # kWh → Wh
+
+
+@pytest.mark.parametrize("line, expected", [
+    ("Load Profile 2 - export 2021", "24h"),
+    ("Load Profile 2 (journalier)", "24h"),
+    ("Profil de charge 1", "15min"),
+    ("Load Profile 2A", None),
+    ("Load Profile 2.1", None),
+    ("Load Profile 2021", None),
+])
+def test_extract_load_profile_requires_isolated_number(line, expected):
+    _, name, interval = m.extract_load_profile(line)
+    if expected is None:
+        assert name == ""
+    else:
+        assert interval == expected
