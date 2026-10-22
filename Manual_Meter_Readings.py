@@ -945,6 +945,15 @@ class OBISCodeHandler:
             return obis_code
 
 
+def is_profile_value_column(col_idx: int, obis: str) -> bool:
+    """
+    Colonne de mesure d'un buffer de profil, identifiée par son OBIS et non par sa position :
+    exclut l'horloge (index 0) et les objets non énergétiques 0-0:1.* et 0-0:96.*
+    (dont le statut 0-0:96.10.x), quel que soit leur index.
+    """
+    return col_idx != 0 and not obis.startswith(("0-0:1.", "0-0:96."))
+
+
 class ProfileDetector:
     """Détecteur de métadonnées de profil sans valeurs hardcodées."""
 
@@ -1270,7 +1279,7 @@ class DataPathResolver:
             # Extraire valeurs pour chaque OBIS
             values = {}
             for col_idx, obis_code in capture_objects.items():
-                if col_idx < 2:  # Skip timestamp et DST
+                if not is_profile_value_column(col_idx, obis_code):
                     continue
 
                 if col_idx in row_data and str(row_data[col_idx]).strip():
@@ -2025,10 +2034,30 @@ def parse_xml(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
             )
 
 
+XML_LOAD_PROFILES = {
+    1: ("Profil de charge 1", "15min"),
+    2: ("Profil de charge 2", "24h"),
+}
+
+
+def detect_xml_profile_numbers(root: ET.Element) -> List[int]:
+    """Profils de charge présents : objet ProfileStatus_Load0N ou buffer DD.Profile_LoadN / Load0N."""
+    status_pattern = re.compile(r"ProfileStatus_Load0?([12])(?!\d)")
+    buffer_pattern = re.compile(r"DD\.Profile_Load0?([12])\.buffer\.(?:Selector1\.Response|0)\.\d+\.\d+")
+    found = set()
+    for elem in root.iter():
+        match = (status_pattern.search(elem.get("ObjectName", "")) or
+                 buffer_pattern.match(elem.get("FieldName", "")))
+        if match:
+            found.add(int(match.group(1)))
+    return sorted(found)
+
+
 def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
     """
     Parse un fichier XML DLMS/COSEM de profil de charge (ProfileBuffer).
     Utilisé pour les fichiers E360, LGZ avec des séries temporelles.
+    Retourne un ParsedMeterData par profil présent (LP1 et/ou LP2).
     """
     warnings: List[str] = []
 
@@ -2050,54 +2079,33 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
     ddid_elem = root.find(".//{http://tempuri.org/DeviceDescriptionDataSet.xsd}DDID")
     if ddid_elem is None:
         ddid_elem = root.find(".//DDID")
-    
+
     if ddid_elem is None or not ddid_elem.text:
         warnings.append("DDID (meter ID) non trouvé dans le fichier XML")
         return []
-    
+
     meter_id = ddid_elem.text.strip()
-    
-    # === 2. Détecter le profil de charge ===
-    profile_name = ""
-    interval = ""
-    profile_num = ""
-    
-    for obj in root.iter():
-        obj_name = obj.get("ObjectName", "")
-        if "ProfileStatus_Load01" in obj_name:
-            profile_name = "Profil de charge 1"
-            interval = "15min"
-            profile_num = "1"
-            break
-        elif "ProfileStatus_Load02" in obj_name:
-            profile_name = "Profil de charge 2"
-            interval = "24h"
-            profile_num = "2"
-            break
-    
-    if not profile_name:
+
+    # === 2. Détecter les profils de charge ===
+    profiles = [(num, *XML_LOAD_PROFILES[num]) for num in detect_xml_profile_numbers(root)]
+
+    if not profiles:
         for field in root.iter():
             field_name = field.get("FieldName", "")
             if "capture_period" in field_name and field.get("FieldValue"):
                 try:
                     period = int(field.get("FieldValue", "0"))
                     if period == 900:
-                        profile_name = "Profil de charge 1"
-                        interval = "15min"
-                        profile_num = "1"
+                        profiles = [(1, *XML_LOAD_PROFILES[1])]
                     elif period == 86400:
-                        profile_name = "Profil de charge 2"
-                        interval = "24h"
-                        profile_num = "2"
+                        profiles = [(2, *XML_LOAD_PROFILES[2])]
                 except ValueError:
                     pass
                 break
-    
-    if not profile_name:
+
+    if not profiles:
         warnings.append("Type de profil non détecté, utilisation par défaut: 15min")
-        profile_name = "Profil de charge"
-        interval = "15min"
-        profile_num = "1"
+        profiles = [(1, "Profil de charge", "15min")]
 
     # === 3. Extraire les unités (scaler_unit) des TariffEnergyRegister ===
     tariff_registers: Dict[str, Dict[str, Any]] = {}
@@ -2155,31 +2163,47 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         if unit_info.resolved_unit:
             unit_map_from_scaler.setdefault(obis, unit_info.resolved_unit)
 
+    results = []
+    for profile_num, profile_name, interval in profiles:
+        data = parse_xml_load_profile(
+            root, meter_id, filename, profile_num, profile_name, interval,
+            unit_map_from_scaler, list(warnings)
+        )
+        if data is not None:
+            results.append(data)
+    return results
+
+
+def parse_xml_load_profile(
+    root: ET.Element,
+    meter_id: str,
+    filename: str,
+    profile_num: int,
+    profile_name: str,
+    interval: str,
+    unit_map_from_scaler: Dict[str, str],
+    warnings: List[str],
+) -> Optional[ParsedMeterData]:
+    """Parse le buffer d'un profil (DD.Profile_LoadN ou DD.Profile_Load0N) ; None si aucune mesure."""
     # === 4. Extraire les capture_objects ===
     capture_objects: Dict[int, str] = {}
 
-    # Patterns pour différents formats de fichiers
-    # Format 1: DD.Profile_Load01 (LGZ avec 0)
-    # Format 2: DD.Profile_Load1 (E360 sans 0)
-    pattern_capture_obj_1 = re.compile(
-        rf"DD\.Profile_Load{profile_num}\.capture_objects\.0\.(\d+)\.logical_name"
-    )
-    pattern_capture_obj_2 = re.compile(
-        rf"DD\.Profile_Load{int(profile_num)}\.capture_objects\.0\.(\d+)\.logical_name"
+    pattern_capture_obj = re.compile(
+        rf"DD\.Profile_Load0?{profile_num}\.capture_objects\.0\.(\d+)\.logical_name"
     )
 
-    for field in root.iter():
-        field_name = field.get("FieldName", "")
-        match = pattern_capture_obj_1.match(field_name) or pattern_capture_obj_2.match(field_name)
-        if match and field.get("FieldValue"):
+    for xml_field in root.iter():
+        field_name = xml_field.get("FieldName", "")
+        match = pattern_capture_obj.match(field_name)
+        if match and xml_field.get("FieldValue"):
             idx = int(match.group(1))
-            obis_hex = field.get("FieldValue", "")
+            obis_hex = xml_field.get("FieldValue", "")
             obis_readable = obis_hex_to_readable(obis_hex)
             capture_objects[idx] = obis_readable
 
     if not capture_objects:
         warnings.append("capture_objects non trouvés dans le fichier XML")
-        return []
+        return None
 
     status_col_idx = next(
         (idx for idx, obis in capture_objects.items() if STATUS_REGISTER_PATTERN.match(obis)),
@@ -2188,16 +2212,13 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
     status_mismatch_count = 0
     status_mismatch_samples: List[Tuple[datetime, int, int]] = []
 
-    # === 5. Initialiser les channels ===
+    # === 5. Initialiser les channels (colonnes identifiées par leur OBIS) ===
     channels: Dict[str, Dict[str, Any]] = {}
 
     for idx, obis in capture_objects.items():
-        if idx < 2:
+        if not is_profile_value_column(idx, obis):
             continue
-        
-        if obis.startswith("0-0:96.") or obis.startswith("0-0:1."):
-            continue
-        
+
         # Unité par défaut
         if obis.startswith("1-0:1.") or obis.startswith("1-0:2."):
             unit = "Wh"
@@ -2210,45 +2231,40 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         detected_unit = unit_map_from_scaler.get(obis, unit)
         channels[obis] = {"unit": detected_unit, "readings": []}
 
+    value_columns = [
+        (idx, capture_objects[idx]) for idx in sorted(capture_objects)
+        if capture_objects[idx] in channels
+    ]
+
     # === 6. Extraire les données du buffer ===
-    # Patterns pour différents formats de fichiers
-    # Format LGZ: DD.Profile_Load01.buffer.Selector1.Response.X.Y
-    pattern_response_1 = re.compile(
-        rf"DD\.Profile_Load{profile_num}\.buffer\.Selector1\.Response\.(\d+)\.(\d+)"
-    )
-    # Format E360 avec buffer direct: DD.Profile_Load1.buffer.0.X.Y
-    pattern_response_2 = re.compile(
-        rf"DD\.Profile_Load{int(profile_num)}\.buffer\.0\.(\d+)\.(\d+)"
-    )
-    # Format LGZ sans 0: (au cas où)
-    pattern_response_3 = re.compile(
-        rf"DD\.Profile_Load{int(profile_num)}\.buffer\.Selector1\.Response\.(\d+)\.(\d+)"
+    # Format LGZ : DD.Profile_Load1.buffer.Selector1.Response.X.Y
+    # Format E360 avec buffer direct : DD.Profile_Load1.buffer.0.X.Y
+    pattern_response = re.compile(
+        rf"DD\.Profile_Load0?{profile_num}\.buffer\.(?:Selector1\.Response|0)\.(\d+)\.(\d+)"
     )
 
     response_data: Dict[int, Dict[int, str]] = {}
     timestamp_field_type = ""
 
-    for field in root.iter():
-        field_name = field.get("FieldName", "")
-        match = (pattern_response_1.match(field_name) or
-                 pattern_response_2.match(field_name) or
-                 pattern_response_3.match(field_name))
+    for xml_field in root.iter():
+        field_name = xml_field.get("FieldName", "")
+        match = pattern_response.match(field_name)
         if match:
             row = int(match.group(1))
             col = int(match.group(2))
-            value = field.get("FieldValue", "")
-            field_type = field.get("FieldType", "")
-            
+            value = xml_field.get("FieldValue", "")
+            field_type = xml_field.get("FieldType", "")
+
             if col == 0 and not timestamp_field_type and field_type:
                 timestamp_field_type = field_type
 
             if row not in response_data:
                 response_data[row] = {}
             response_data[row][col] = value
-    
+
     if not response_data:
         warnings.append("Aucune donnée de mesure trouvée dans le buffer")
-        return []
+        return None
 
     # Horodatages en UTC seulement si le type du champ le déclare ; sinon heure locale,
     # avec le statut DST résolu ligne par ligne (voir decode_dlms_timestamp).
@@ -2292,18 +2308,8 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         elif status_source == "calendar":
             calendar_count += 1
 
-        for col_idx in range(2, max(row_data.keys()) + 1):
-            if col_idx not in row_data:
-                continue
-            
-            if col_idx not in capture_objects:
-                continue
-            
-            obis = capture_objects[col_idx]
-            if obis not in channels:
-                continue
-            
-            if not str(row_data[col_idx]).strip():
+        for col_idx, obis in value_columns:
+            if col_idx not in row_data or not str(row_data[col_idx]).strip():
                 continue
 
             value = parse_number(row_data[col_idx])
@@ -2351,10 +2357,10 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
 
     if total_readings == 0:
         warnings.append("Aucune mesure valide extraite du fichier")
-        return []
+        return None
 
     # === 9. Retourner les données parsées ===
-    return [ParsedMeterData(
+    return ParsedMeterData(
         meter_id=meter_id,
         load_profile=profile_name,
         interval=interval,
@@ -2363,7 +2369,7 @@ def parse_xml_profile_buffer(file_bytes: bytes, filename: str) -> List[ParsedMet
         warnings=warnings,
         from_xml=True,  # Flag pour identifier les données XML
         timestamps_utc=timestamps_are_utc
-    )]
+    )
 
 
 def parse_xml_billing_values(file_bytes: bytes, filename: str) -> List[ParsedMeterData]:
