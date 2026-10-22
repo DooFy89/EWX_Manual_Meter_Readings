@@ -2911,6 +2911,7 @@ def init_session_state():
         "json_outputs": [],
         "warnings": [],
         "mrid_prefix": DEFAULT_MRID_PREFIX,
+        "conversion_params": None,
         "conversion_done": False,
         "files_needing_config": {},
         "user_configs": {}
@@ -3183,22 +3184,20 @@ def create_summary_dataframe(
             if not has_mapping:
                 continue
             
-            timestamps = [r[0] for r in ch_data["readings"]]
-            min_ts = min(timestamps)
-            max_ts = max(timestamps)
-            
-            dst_val = ch_data["readings"][0][2]
-            offset = resolve_offset(dst_val, data.timestamps_utc)
-            
-            desc = OBIS_DESCRIPTIONS.get(obis, obis)
+            # Ordre chronologique : à heure locale égale (heure doublée), l'heure d'été précède
+            def chrono(r):
+                return (r[0], 0 if status_has_dst(r[2]) else 1)
+            first = min(ch_data["readings"], key=chrono)
+            last = max(ch_data["readings"], key=chrono)
+
             unit = ch_data.get("unit", "")
-            
+
             rows.append({
                 "N° Compteur": mrid,
                 "Channel": obis,
                 "Unité": unit,
-                "Date min": min_ts.strftime(f"%Y-%m-%d %H:%M") + offset,
-                "Date max": max_ts.strftime(f"%Y-%m-%d %H:%M") + offset,
+                "Date min": first[0].strftime("%Y-%m-%d %H:%M") + resolve_offset(first[2], data.timestamps_utc),
+                "Date max": last[0].strftime("%Y-%m-%d %H:%M") + resolve_offset(last[2], data.timestamps_utc),
                 "Nb points": len(ch_data["readings"])
             })
     
@@ -3217,16 +3216,33 @@ def create_zip_download(json_outputs: List[Dict]) -> bytes:
     return buffer.getvalue()
 
 
+def meter_display_name(data: ParsedMeterData, mrid_prefix: str) -> str:
+    """mRID affiché (pour XML, le meter_id est déjà complet)."""
+    return data.meter_id if data.from_xml else f"{mrid_prefix}{data.meter_id}"
+
+
+def dataset_labels(data_list: List[ParsedMeterData], mrid_prefix: str) -> List[str]:
+    """Libellés des jeux de données ; fichier source et période ajoutés en cas de doublon."""
+    labels = []
+    for data in data_list:
+        lp_abbrev = extract_lp_abbreviation(data.load_profile)
+        labels.append(meter_display_name(data, mrid_prefix) + (f" ({lp_abbrev})" if lp_abbrev else ""))
+
+    duplicates = {label for label in labels if labels.count(label) > 1}
+    for i, data in enumerate(data_list):
+        if labels[i] in duplicates:
+            timestamps = [r[0] for ch in data.channels.values() for r in ch["readings"]]
+            period = f", {min(timestamps):%d.%m.%Y} - {max(timestamps):%d.%m.%Y}" if timestamps else ""
+            labels[i] = f"{labels[i]} - {data.source_file}{period}"
+    return labels
+
+
 def render_chart(
-    data_list: List[ParsedMeterData],
-    meter_id: str,
-    load_profile: str,
-    obis_code: str
+    meter_data: ParsedMeterData,
+    obis_code: str,
+    mrid_prefix: str
 ):
     """Affiche le graphique de courbe de charge avec Plotly."""
-    meter_data = next((d for d in data_list
-                       if d.meter_id == meter_id and d.load_profile == load_profile), None)
-    
     if not meter_data or obis_code not in meter_data.channels:
         st.warning("Données non trouvées pour cette sélection")
         return
@@ -3244,11 +3260,7 @@ def render_chart(
     
     unit = ch_data.get("unit", "")
     
-    # Pour XML, le meter_id est déjà complet
-    if meter_data.from_xml:
-        display_mrid = meter_id
-    else:
-        display_mrid = f"{st.session_state.get('mrid_prefix', DEFAULT_MRID_PREFIX)}{meter_id}"
+    display_mrid = meter_display_name(meter_data, mrid_prefix)
     
     df = pd.DataFrame([
         {
@@ -3347,7 +3359,10 @@ def main():
             help="Préfixe ajouté au numéro de compteur pour former le mRID (non utilisé pour les fichiers XML)"
         )
         st.session_state.mrid_prefix = mrid_prefix
-        
+
+        # Paramètres de la dernière conversion : les JSON déjà générés en dépendent
+        params = st.session_state.conversion_params or {"source": source, "mrid_prefix": mrid_prefix}
+
         delimiter_display = {
             "auto": "Détection auto",
             ";": "Point-virgule (;)",
@@ -3399,6 +3414,7 @@ def main():
                 st.session_state.conversion_done = False
                 st.session_state.files_needing_config = {}
                 st.session_state.user_configs = {}
+                st.session_state.conversion_params = None
                 st.rerun()
     
     # === TRAITEMENT ===
@@ -3417,6 +3433,8 @@ def main():
             
             json_outputs, billing_values_skipped = build_json_outputs(data_list, source, mrid_prefix)
             st.session_state.json_outputs = json_outputs
+            st.session_state.conversion_params = {"source": source, "mrid_prefix": mrid_prefix}
+            params = st.session_state.conversion_params
             st.session_state.conversion_done = True
 
         if data_list:
@@ -3435,7 +3453,13 @@ def main():
 
         if not data_list and not files_needing_config:
             st.error("Aucun compteur n'a pu être traité. Vérifiez les avertissements.")
-    
+
+    if params != {"source": source, "mrid_prefix": mrid_prefix}:
+        st.info(
+            f"Les paramètres ont changé depuis la conversion (source {params['source']}, "
+            f"préfixe {params['mrid_prefix']}). Cliquez à nouveau sur « Convertir » pour les appliquer."
+        )
+
     # === CONFIGURATION MANUELLE ===
     if st.session_state.files_needing_config:
         st.header("Configuration manuelle requise")
@@ -3468,7 +3492,7 @@ def main():
                         missing = ", ".join(still_needing[config_key]["data"].needs_user_input)
                         st.error(f"Configuration insuffisante pour {filename} : {missing}")
                     else:
-                        new_outputs, _ = build_json_outputs(new_data, source, mrid_prefix)
+                        new_outputs, _ = build_json_outputs(new_data, params["source"], params["mrid_prefix"])
                         st.session_state.processed_data.extend(new_data)
                         st.session_state.json_outputs.extend(new_outputs)
                         st.session_state.warnings.extend(new_warnings)
@@ -3520,50 +3544,27 @@ def main():
     if st.session_state.processed_data:
         st.header("Visualisation")
 
-        # Créer des clés composites (meter_id, load_profile) pour distinguer les Load Profiles
-        meter_keys = [(d.meter_id, d.load_profile) for d in st.session_state.processed_data]
+        # Chaque jeu de données est identifié par son index (même compteur et même LP possibles)
+        data_list = st.session_state.processed_data
+        labels = dataset_labels(data_list, params["mrid_prefix"])
 
         col1, col2 = st.columns(2)
 
         with col1:
-            # Afficher le bon format selon le type de fichier avec LP si applicable
-            def format_meter_display(meter_key):
-                meter_id, load_profile = meter_key
-                data = next((d for d in st.session_state.processed_data
-                            if d.meter_id == meter_id and d.load_profile == load_profile), None)
-
-                # Extraire abréviation LP (LP1, LP2, etc.)
-                lp_abbrev = extract_lp_abbreviation(load_profile)
-                suffix = f" ({lp_abbrev})" if lp_abbrev else ""
-
-                if data and data.from_xml:
-                    return f"{meter_id}{suffix}"
-                return f"{st.session_state.mrid_prefix}{meter_id}{suffix}"
-
-            selected_meter_key = st.selectbox(
+            selected_data_idx = st.selectbox(
                 "Compteur",
-                options=meter_keys,
-                format_func=format_meter_display
+                options=range(len(data_list)),
+                format_func=lambda i: labels[i]
             )
 
-        # Extraire meter_id et load_profile depuis la clé composite
-        selected_meter_id, selected_load_profile = selected_meter_key
-
+        meter_data = data_list[selected_data_idx]
         channels: List[Tuple[str, str]] = []
-        meter_data = next(
-            (d for d in st.session_state.processed_data
-             if d.meter_id == selected_meter_id and d.load_profile == selected_load_profile),
-            None
-        )
-
-        if meter_data:
-            for obis in meter_data.channels:
-                has_mapping = OBIS_TO_IEC.get((obis, meter_data.interval)) or OBIS_TO_IEC.get((obis, "NULL"))
-                if not has_mapping:
-                    continue
-                unit = meter_data.channels[obis].get("unit", "")
-                display = get_obis_display_name(obis, unit)
-                channels.append((obis, display))
+        for obis in meter_data.channels:
+            has_mapping = OBIS_TO_IEC.get((obis, meter_data.interval)) or OBIS_TO_IEC.get((obis, "NULL"))
+            if not has_mapping:
+                continue
+            unit = meter_data.channels[obis].get("unit", "")
+            channels.append((obis, get_obis_display_name(obis, unit)))
 
         with col2:
             if channels:
@@ -3576,14 +3577,9 @@ def main():
             else:
                 selected_obis = None
                 st.warning("Aucun canal disponible pour ce compteur")
-        
-        if selected_meter_id and selected_obis:
-            render_chart(
-                st.session_state.processed_data,
-                selected_meter_id,
-                selected_load_profile,
-                selected_obis
-            )
+
+        if selected_obis:
+            render_chart(meter_data, selected_obis, params["mrid_prefix"])
 
     st.write("#")
 
@@ -3593,7 +3589,7 @@ def main():
         
         summary_df = create_summary_dataframe(
             st.session_state.processed_data,
-            st.session_state.mrid_prefix
+            params["mrid_prefix"]
         )
         
         if not summary_df.empty:
